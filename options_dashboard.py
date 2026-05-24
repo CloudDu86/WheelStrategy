@@ -12,16 +12,21 @@ st.set_page_config(page_title="期权复盘工具", layout="wide")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 def _scan_data_files() -> dict[str, list[tuple[str, str]]]:
-    """扫描 data/ 目录，返回 {ticker: [(label, path), ...]} 按文件名排序。"""
-    files = glob.glob(os.path.join(DATA_DIR, "*_options_*_greeks.csv"))
+    """扫描 data/ 目录，返回 {ticker: [(label, path), ...]} 按文件名排序。
+    接受两种命名：
+      TICKER_options_<period>_greeks.csv   (短期 CC/CSP 数据)
+      TICKER_LEAPS_<period>_greeks.csv     (深 ITM 长期 LEAPS 数据)
+    """
+    files = glob.glob(os.path.join(DATA_DIR, "*_greeks.csv"))
     result: dict[str, list[tuple[str, str]]] = {}
     for path in sorted(files):
         fname = os.path.basename(path)
-        m = re.match(r"^([A-Z]+)_options_(.+)_greeks\.csv$", fname)
+        m = re.match(r"^([A-Z]+)_(options|LEAPS)_(.+)_greeks\.csv$", fname)
         if not m:
             continue
-        ticker, period = m.group(1), m.group(2)
-        label = period.replace("_", " → ")
+        ticker, category, period = m.group(1), m.group(2), m.group(3)
+        tag = "LEAPS" if category == "LEAPS" else "options"
+        label = f"[{tag}] " + period.replace("_", " → ")
         result.setdefault(ticker, []).append((label, path))
     return result
 
@@ -66,8 +71,37 @@ def get_mid(df: pd.DataFrame, symbol: str, d: date) -> float | None:
     return float(row.iloc[0]["mid"])
 
 
+def get_mid_smart(df: pd.DataFrame, pos: dict, d: date, spot: float | None) -> tuple[float | None, bool]:
+    """优先取真实 mid；若数据缺失（如 LEAPS 跌出 DTE 365 过滤范围），
+    用 intrinsic value 估算当前价（只对 Long 仓位安全）。
+    返回 (value, is_estimated)。"""
+    real_mid = get_mid(df, pos["symbol"], d)
+    if real_mid is not None:
+        return real_mid, False
+    # 已到期：直接给 0（auto_expire 通常会先处理掉，但兜底）
+    if pos["expiry"] <= d:
+        return 0.0, True
+    # 仅 Long 期权做 intrinsic 估算（Short 用 intrinsic 会低估盘口成本，不安全）
+    if pos["direction"] == 1 and spot is not None:
+        iv = intrinsic_value(pos["type"], pos["strike"], spot)
+        return iv, True
+    return None, False
+
+
 def get_underlying_at(df: pd.DataFrame, d: date) -> float | None:
     return estimate_underlying(df[df["snapshot_date"] == d])
+
+
+LIQUIDITY_MIN = 5  # volume + open_interest 的最小阈值
+
+def filter_liquid(chain: pd.DataFrame) -> pd.DataFrame:
+    """过滤无流动性合约（volume + open_interest < LIQUIDITY_MIN），避免 ghost quotes 污染选择。
+    无成交、OI 极低的远 OTM 合约在 QC 数据里 bid=ask=理论值，IV/Delta 严重失真。
+    阈值 5 = 至少有几手持仓或成交才算真实可交易合约。"""
+    if chain.empty:
+        return chain
+    liq = chain["volume"].fillna(0) + chain["open_interest"].fillna(0)
+    return chain[liq >= LIQUIDITY_MIN]
 
 
 def intrinsic_value(opt_type: str, strike: float, spot: float | None) -> float:
@@ -147,6 +181,137 @@ def close_position(account: dict, pos: dict, close_date: date, close_mid: float,
     })
 
 
+def _add_lot(account: dict, ticker: str, qty: int, price: float, lot_date: date) -> None:
+    """追加一个买入批次到持股记录。"""
+    sh = account["shares"].setdefault(ticker, {"qty": 0, "cost_basis": price, "lots": []})
+    sh.setdefault("lots", []).append({"qty": qty, "price": price, "date": str(lot_date)})
+
+
+def _sell_lots_fifo(account: dict, ticker: str, shares_qty: int) -> float:
+    """FIFO 卖出：消耗最早批次，返回实际成本总额，并更新 lots 列表和 cost_basis。"""
+    sh = account["shares"][ticker]
+    lots = sh.get("lots", [])
+    if not lots:
+        return sh["cost_basis"] * shares_qty
+
+    remaining = shares_qty
+    fifo_cost = 0.0
+    new_lots = []
+    for lot in lots:
+        if remaining <= 0:
+            new_lots.append(lot)
+        elif lot["qty"] <= remaining:
+            fifo_cost += lot["qty"] * lot["price"]
+            remaining -= lot["qty"]
+        else:
+            fifo_cost += remaining * lot["price"]
+            new_lots.append({"qty": lot["qty"] - remaining, "price": lot["price"], "date": lot["date"]})
+            remaining = 0
+
+    sh["lots"] = new_lots
+    total_qty = sum(l["qty"] for l in new_lots)
+    if total_qty > 0:
+        sh["cost_basis"] = sum(l["qty"] * l["price"] for l in new_lots) / total_qty
+    return fifo_cost
+
+
+def rewind_to_date(initial_capital: float, full_history: list, all_positions: list,
+                    all_closed_positions: list, target_date: date) -> tuple:
+    """⏰ Time Machine：从 initial_capital 起，重放 history 至 target_date，
+    返回 (account, open_positions, closed_positions) 三元组。
+    - close_date > target_date 的 closed_position 会"复活"为 target 时点的 open 仓
+    - shares / lots / equity_cost / premium_collected 全部按动作精确重建"""
+
+    def _to_d(x):
+        if isinstance(x, date):
+            return x
+        return date.fromisoformat(str(x))
+
+    acc = {
+        "initial_capital": initial_capital,
+        "cash": initial_capital,
+        "collateral": 0.0,
+        "shares": {},
+        "realized_pnl": 0.0,
+        "history": [],
+        "equity_cost": {},
+        "premium_collected": {},
+    }
+
+    # ── 按时间顺序重放 history ──
+    for h in sorted(full_history, key=lambda x: _to_d(x.get("date"))):
+        h_d = _to_d(h["date"])
+        if h_d > target_date:
+            break
+        acc["cash"] += h.get("cash_delta", 0.0) or 0.0
+        acc["realized_pnl"] += h.get("realized", 0.0) or 0.0
+        acc["history"].append(h)
+
+        action = h.get("action", "") or ""
+        sym    = h.get("symbol", "") or ""
+        qty    = h.get("qty", 0) or 0
+        price  = h.get("price", 0.0) or 0.0
+        cash_d = h.get("cash_delta", 0.0) or 0.0
+
+        if action == "直接买入股票":
+            sh = acc["shares"].setdefault(sym, {"qty": 0, "cost_basis": price, "lots": []})
+            new_q = sh["qty"] + qty
+            sh["cost_basis"] = (sh["qty"] * sh["cost_basis"] + qty * price) / new_q if new_q else price
+            sh["qty"] = new_q
+            sh["lots"].append({"qty": qty, "price": price, "date": str(h_d)})
+            acc["equity_cost"][sym] = acc["equity_cost"].get(sym, 0.0) + price * qty
+
+        elif "被行权 - 买入股票" in action:
+            sh = acc["shares"].setdefault(sym, {"qty": 0, "cost_basis": price, "lots": []})
+            new_q = sh["qty"] + qty
+            sh["cost_basis"] = (sh["qty"] * sh["cost_basis"] + qty * price) / new_q if new_q else price
+            sh["qty"] = new_q
+            sh["lots"].append({"qty": qty, "price": price, "date": str(h_d)})
+            acc["equity_cost"][sym] = acc["equity_cost"].get(sym, 0.0) + price * qty
+
+        elif "被行权 - 卖出股票" in action:
+            sh = acc["shares"].get(sym)
+            if sh and sh["qty"] >= qty:
+                fifo_cost = _sell_lots_fifo(acc, sym, qty)
+                sh["qty"] -= qty
+                if sh["qty"] <= 0:
+                    acc["equity_cost"][sym] = 0.0
+                    acc["premium_collected"][sym] = 0.0
+                else:
+                    acc["equity_cost"][sym] = max(0.0, acc["equity_cost"].get(sym, 0.0) - fifo_cost)
+
+        elif ("开仓" in action and "Short" in action) or ("虚拟建仓" in action and "Short" in action):
+            # Short 开仓 → 累计权利金（按底层股票归集）
+            if cash_d > 0:
+                underlying = sym.split(" ")[0] if " " in sym else ""
+                if underlying:
+                    acc["premium_collected"][underlying] = \
+                        acc["premium_collected"].get(underlying, 0.0) + cash_d
+
+    # ── 重建仓位 ──
+    open_pos, closed_pos = [], []
+
+    for p in all_positions:
+        ed = _to_d(p.get("entry_date"))
+        if ed <= target_date:
+            open_pos.append(p)
+
+    for p in all_closed_positions:
+        ed = _to_d(p.get("entry_date"))
+        if ed > target_date:
+            continue  # 还没建仓
+        cd_raw = p.get("close_date")
+        cd = _to_d(cd_raw) if cd_raw else None
+        if cd is None or cd > target_date:
+            # target 时此仓未平 → 复活为 open
+            revived = {k: v for k, v in p.items() if k not in ("close_date", "close_mid", "realized")}
+            open_pos.append(revived)
+        else:
+            closed_pos.append(p)
+
+    return acc, open_pos, closed_pos
+
+
 def _assign_short_put(account: dict, pos: dict, assign_date: date) -> None:
     """Short Put ITM 到期：买入正股，实现期权权利金。"""
     shares_qty = CONTRACT_MULT * pos["qty"]
@@ -163,7 +328,7 @@ def _assign_short_put(account: dict, pos: dict, assign_date: date) -> None:
     # 更新股票持仓（加权平均成本）
     ticker = pos["ticker"]
     if ticker not in account["shares"]:
-        account["shares"][ticker] = {"qty": 0, "cost_basis": pos["strike"]}
+        account["shares"][ticker] = {"qty": 0, "cost_basis": pos["strike"], "lots": []}
     old_qty = account["shares"][ticker]["qty"]
     old_basis = account["shares"][ticker]["cost_basis"]
     new_qty = old_qty + shares_qty
@@ -171,6 +336,7 @@ def _assign_short_put(account: dict, pos: dict, assign_date: date) -> None:
         (old_qty * old_basis + shares_qty * pos["strike"]) / new_qty
     )
     account["shares"][ticker]["qty"] = new_qty
+    _add_lot(account, ticker, shares_qty, pos["strike"], assign_date)
 
     pos["close_date"] = assign_date
     pos["close_mid"] = 0.0
@@ -201,19 +367,25 @@ def _assign_short_call(account: dict, pos: dict, assign_date: date, spot: float 
 
     if is_covered:
         proceeds = pos["strike"] * shares_qty
-        cost_basis = account["shares"][ticker]["cost_basis"]
+        # FIFO：消耗最早批次，返回该批实际成本，同时更新 lots 和 cost_basis
+        fifo_cost = _sell_lots_fifo(account, ticker, shares_qty)
         account["shares"][ticker]["qty"] -= shares_qty
         account["cash"] += proceeds
-        stock_pnl = (pos["strike"] - cost_basis) * shares_qty
+        stock_pnl = proceeds - fifo_cost
         realized = premium + stock_pnl
         cash_delta = proceeds
         action = "Short Call 被行权 - 卖出股票 (备兑)"
-        note = (f"按 ${pos['strike']:.2f} 出售 {shares_qty} 股 | "
+        avg_fifo = fifo_cost / shares_qty
+        note = (f"按 ${pos['strike']:.2f} 出售 {shares_qty} 股（FIFO均价 ${avg_fifo:.2f}）| "
                 f"权利金 ${premium:+,.2f} + 股票差价 ${stock_pnl:+,.2f}")
-        # 持股归零时重置本轮成本追踪，避免历史数据污染下一轮动态成本
+        # equity_cost 按 FIFO 实际成本缩减
+        ec = account.setdefault("equity_cost", {})
         if account["shares"][ticker]["qty"] <= 0:
-            account.setdefault("equity_cost", {})[ticker] = 0.0
+            # 持股归零：重置本轮成本追踪
+            ec[ticker] = 0.0
             account.setdefault("premium_collected", {})[ticker] = 0.0
+        else:
+            ec[ticker] = max(0.0, ec.get(ticker, 0.0) - fifo_cost)
     else:
         intrinsic = intrinsic_value("Call", pos["strike"], spot) * CONTRACT_MULT * pos["qty"]
         account["cash"] -= intrinsic
@@ -267,12 +439,13 @@ def buy_equity(account: dict, ticker: str, price: float, qty: int, buy_date: dat
 
     sh = account["shares"]
     if ticker not in sh:
-        sh[ticker] = {"qty": 0, "cost_basis": price}
+        sh[ticker] = {"qty": 0, "cost_basis": price, "lots": []}
     old_qty   = sh[ticker]["qty"]
     old_basis = sh[ticker]["cost_basis"]
     new_qty   = old_qty + qty
     sh[ticker]["cost_basis"] = (old_qty * old_basis + qty * price) / new_qty
     sh[ticker]["qty"] = new_qty
+    _add_lot(account, ticker, qty, price, buy_date)
 
     record_trade(account, {
         "date":       buy_date,
@@ -357,6 +530,12 @@ def load_workspace(json_str: str) -> dict:
     payload = json.loads(json_str)
     acc = payload["account"]
     acc["history"] = [_history_from_json(h) for h in acc.get("history", [])]
+    # 向后兼容：旧 workspace 的 shares 无 lots 字段，合成单一批次
+    for sh in acc.get("shares", {}).values():
+        if "lots" not in sh and sh.get("qty", 0) > 0:
+            sh["lots"] = [{"qty": sh["qty"], "price": sh["cost_basis"], "date": "imported"}]
+        elif "lots" not in sh:
+            sh["lots"] = []
     payload["account"] = acc
     payload["positions"] = [_pos_from_json(p) for p in payload.get("positions", [])]
     payload["closed_positions"] = [_pos_from_json(p) for p in payload.get("closed_positions", [])]
@@ -405,8 +584,11 @@ def auto_expire(df: pd.DataFrame, account: dict, open_positions: list,
 
 def compute_unrealized(df: pd.DataFrame, open_positions: list, cur_date: date) -> float:
     total = 0.0
+    # 估算当前 spot，供 Long 仓位 intrinsic fallback 用
+    day = df[df["snapshot_date"] == cur_date]
+    spot = estimate_underlying(day) if not day.empty else None
     for pos in open_positions:
-        mid = get_mid(df, pos["symbol"], cur_date)
+        mid, _ = get_mid_smart(df, pos, cur_date, spot)
         if mid is not None:
             total += pos["direction"] * (mid - pos["entry_mid"]) * CONTRACT_MULT * pos["qty"]
     return total
@@ -469,8 +651,8 @@ if "current_date_idx" not in st.session_state:
     st.session_state.current_date_idx = None  # 加载数据后初始化
 if "_pending_date_idx" not in st.session_state:
     st.session_state._pending_date_idx = None
-if "active_data_file" not in st.session_state:
-    st.session_state.active_data_file = None
+if "active_data_files" not in st.session_state:
+    st.session_state.active_data_files = []
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -490,9 +672,9 @@ with st.sidebar:
         st.session_state.closed_positions = []
         st.session_state.account = init_account(st.session_state.initial_capital)
         st.session_state.current_date_idx = None
-        st.session_state.active_data_file = None  # 重置文件选择
+        st.session_state.active_data_files = []  # 重置文件选择
 
-    # ── 数据文件选择 ──────────────────────────────────────────────────────────
+    # ── 数据文件选择（多选）────────────────────────────────────────────────────
     file_options = TICKER_DATA.get(selected_ticker, [])
     if not file_options:
         st.error(f"data/ 目录下找不到 {selected_ticker} 的数据文件")
@@ -500,27 +682,36 @@ with st.sidebar:
 
     file_labels = [label for label, _ in file_options]
     file_paths  = [path  for _, path  in file_options]
+    label_of    = dict(zip(file_paths, file_labels))
 
-    # 默认选最新文件（列表末尾）
-    if "active_data_file" not in st.session_state or st.session_state.active_data_file not in file_paths:
-        st.session_state.active_data_file = file_paths[-1]
+    # 默认选全部文件
+    if not st.session_state.active_data_files or \
+       not any(p in file_paths for p in st.session_state.active_data_files):
+        st.session_state.active_data_files = list(file_paths)
 
-    selected_file = st.selectbox(
-        "数据文件",
+    selected_files = st.multiselect(
+        "数据文件（可多选跨年）",
         file_paths,
-        index=file_paths.index(st.session_state.active_data_file),
-        format_func=lambda p: file_labels[file_paths.index(p)],
+        default=[p for p in st.session_state.active_data_files if p in file_paths],
+        format_func=lambda p: label_of.get(p, p),
     )
-    file_changed = selected_file != st.session_state.active_data_file
-    if file_changed:
-        st.session_state.active_data_file = selected_file
+    if not selected_files:
+        st.warning("请至少选择一个数据文件")
+        st.stop()
+
+    files_changed = set(selected_files) != set(st.session_state.active_data_files)
+    if files_changed:
+        st.session_state.active_data_files = selected_files
         st.session_state.current_date_idx = None  # 重置日期，不清空账户
 
-    data_path = selected_file
+    # 合并多个文件，去重排序
     try:
-        df = load_data(data_path, selected_ticker)
-    except FileNotFoundError:
-        st.error(f"找不到数据文件：{data_path}")
+        frames = [load_data(p, selected_ticker) for p in sorted(selected_files)]
+        df = pd.concat(frames, ignore_index=True).drop_duplicates(
+            subset=["snapshot_date", "option_symbol"]
+        ).sort_values(["snapshot_date", "type", "expiry", "strike"]).reset_index(drop=True)
+    except FileNotFoundError as e:
+        st.error(f"找不到数据文件：{e}")
         st.stop()
 
     all_dates = sorted(df["snapshot_date"].unique())
@@ -585,19 +776,92 @@ with st.sidebar:
         help="上传之前保存的 .json 工作区文件，100% 还原盘面状态",
     )
     if uploaded_ws is not None:
-        try:
-            payload = load_workspace(uploaded_ws.read().decode("utf-8"))
-            st.session_state.account           = payload["account"]
-            st.session_state.positions         = payload["positions"]
-            st.session_state.closed_positions  = payload["closed_positions"]
-            st.session_state.initial_capital   = payload["initial_capital"]
-            st.session_state.active_ticker     = payload["active_ticker"]
-            # current_date_idx 需要在数据加载后校验范围，先暂存
-            st.session_state._pending_date_idx = payload.get("current_date_idx", 0)
-            st.success(f"工作区已加载：{len(payload['positions'])} 个持仓，{len(payload['account']['history'])} 条流水")
+        # 用 (文件名, 文件大小) 作为唯一标识，防止 rerun 后重复加载死循环
+        file_id = (uploaded_ws.name, uploaded_ws.size)
+        if st.session_state.get("_loaded_ws_id") != file_id:
+            try:
+                payload = load_workspace(uploaded_ws.read().decode("utf-8"))
+                st.session_state.account           = payload["account"]
+                st.session_state.positions         = payload["positions"]
+                st.session_state.closed_positions  = payload["closed_positions"]
+                st.session_state.initial_capital   = payload["initial_capital"]
+                st.session_state.active_ticker     = payload["active_ticker"]
+                # current_date_idx 需要在数据加载后校验范围，先暂存
+                st.session_state._pending_date_idx = payload.get("current_date_idx", 0)
+                st.session_state._loaded_ws_id     = file_id   # 标记已加载，下次 rerun 不重复
+                st.success(f"工作区已加载：{len(payload['positions'])} 个持仓，{len(payload['account']['history'])} 条流水")
+                st.rerun()
+            except Exception as e:
+                st.error(f"加载失败：{e}")
+        else:
+            # 文件已加载过（同一会话），显示静态提示
+            st.caption(f"✅ 已加载 `{uploaded_ws.name}`（取消文件并重新上传可强制重载）")
+    else:
+        # 文件被用户取消 → 清除标记，下次再上传同一文件时可以再次加载
+        st.session_state.pop("_loaded_ws_id", None)
+
+    st.divider()
+    st.subheader("⏰ 时间机器")
+    st.caption("回到某一历史日期的仓位状态。当前盘面会被快照保存，可一键返回。")
+
+    # 用 history 中的全部日期范围作为参考（fallback：全数据快照日期）
+    hist_dates = [date.fromisoformat(str(h["date"]))
+                  for h in st.session_state.account.get("history", [])]
+    tm_min = min(hist_dates) if hist_dates else (all_dates[0] if all_dates else date.today())
+    tm_max = all_dates[-1] if all_dates else date.today()
+
+    tm_target = st.date_input(
+        "目标日期",
+        value=st.session_state.get("_tm_last_target") or all_dates[st.session_state.current_date_idx],
+        min_value=tm_min,
+        max_value=tm_max,
+        help="将账户回放到该日期当时的状态（基于交易历史精确重建）",
+    )
+
+    tm_cols = st.columns(2)
+    if tm_cols[0].button("⏰ 回到该日", use_container_width=True, key="tm_rewind"):
+        # 备份当前完整状态（用于"返回现在"）
+        if "_tm_snapshot" not in st.session_state:
+            st.session_state._tm_snapshot = {
+                "account": st.session_state.account,
+                "positions": st.session_state.positions,
+                "closed_positions": st.session_state.closed_positions,
+                "current_date_idx": st.session_state.current_date_idx,
+            }
+        # 重放历史到 target
+        acc_new, open_new, closed_new = rewind_to_date(
+            st.session_state.initial_capital,
+            st.session_state.account["history"],
+            st.session_state.positions,
+            st.session_state.closed_positions,
+            tm_target,
+        )
+        st.session_state.account = acc_new
+        st.session_state.positions = open_new
+        st.session_state.closed_positions = closed_new
+        st.session_state._tm_last_target = tm_target
+        # 把复盘日定位到 target（取 ≤ target 的最近快照）
+        valid_dates = [d for d in all_dates if d <= tm_target]
+        if valid_dates:
+            st.session_state.current_date_idx = all_dates.index(valid_dates[-1])
+        st.success(f"已回到 {tm_target}：{len(open_new)} 个持仓 / {len(closed_new)} 个已平仓")
+        st.rerun()
+
+    if "_tm_snapshot" in st.session_state:
+        if tm_cols[1].button("🔙 返回现在", use_container_width=True, key="tm_restore"):
+            snap = st.session_state._tm_snapshot
+            st.session_state.account = snap["account"]
+            st.session_state.positions = snap["positions"]
+            st.session_state.closed_positions = snap["closed_positions"]
+            st.session_state.current_date_idx = snap["current_date_idx"]
+            del st.session_state._tm_snapshot
+            st.session_state.pop("_tm_last_target", None)
+            st.success("已恢复到最新状态")
             st.rerun()
-        except Exception as e:
-            st.error(f"加载失败：{e}")
+        st.caption("🕓 当前处于回溯视图")
+    else:
+        tm_cols[1].button("🔙 返回现在", use_container_width=True, disabled=True,
+                          key="tm_restore_na", help="未进入回溯，无需返回")
 
     st.divider()
     st.subheader("时间控制")
@@ -612,22 +876,61 @@ with st.sidebar:
     day_df = df[df["snapshot_date"] == selected_date]
     available_expiries = sorted(day_df["expiry"].unique())
 
+    # ── 🚀 LEAPS 模式（联动过滤到期日和期权类型）──
+    leaps_mode = st.checkbox(
+        "🚀 LEAPS 模式（一键过滤长期深实值 Call）",
+        value=st.session_state.get("_leaps_mode", False),
+        key="_leaps_mode",
+        help="开启后：仅显示 Call、DTE>365 的到期日、Delta 0.6-0.9 的合约。\n"
+             "便于挑选 LEAPS 长期持仓（典型 Delta≈0.80，DTE 接近 730）",
+    )
+
+    leaps_expiries = [d for d in available_expiries if (d - selected_date).days > 365]
+    if leaps_mode:
+        if not leaps_expiries:
+            st.warning("⚠️ 当前数据中无 DTE>365 的到期日，无 LEAPS 可选。请关闭 LEAPS 模式或换日期。")
+            expiries_to_show = available_expiries  # 兜底
+        else:
+            expiries_to_show = leaps_expiries
+    else:
+        expiries_to_show = available_expiries
+
     selected_expiry = st.selectbox(
-        "到期日",
-        available_expiries,
+        "到期日" + ("（仅 LEAPS）" if leaps_mode else ""),
+        expiries_to_show,
         format_func=lambda d: f"{d}  (DTE {(d - selected_date).days})",
     )
 
-    # 跳到到期日：让复盘日 = 选中的到期日
-    if selected_expiry in all_dates:
-        if st.button("📅 跳到到期日", use_container_width=True,
-                     help=f"将复盘日设为 {selected_expiry}"):
-            st.session_state.current_date_idx = all_dates.index(selected_expiry)
+    # 跳到到期日：让复盘日 = 选中的到期日（若该日无快照，取最近的 ≤ 到期日的快照）
+    from datetime import timedelta as _td
+    exp_candidates = [d for d in all_dates if d <= selected_expiry]
+    if exp_candidates:
+        exp_jump = exp_candidates[-1]
+        label = "📅 跳到到期日" if exp_jump == selected_expiry else f"📅 跳到到期日 (最近: {exp_jump})"
+        if st.button(label, use_container_width=True,
+                     help=f"将复盘日设为 {exp_jump}"):
+            st.session_state.current_date_idx = all_dates.index(exp_jump)
             st.rerun()
     else:
-        st.caption(f"⚠️ 到期日 {selected_expiry} 不在快照范围内，无法跳转")
+        st.caption(f"⚠️ {selected_expiry} 及之前无可用快照")
 
-    option_type = st.radio("期权类型", ["Call", "Put"])
+    # 跳到到期日的 1 周之前：用于 Roll Up & Out 收租时机检视
+    target_date = selected_expiry - _td(days=7)
+    candidates = [d for d in all_dates if d <= target_date]
+    if candidates:
+        jump_date = candidates[-1]
+        if st.button("⏪ 跳到期日的 1 周之前", use_container_width=True,
+                     help=f"将复盘日设为 {jump_date}（{selected_expiry} 前 7 天最近快照）"):
+            st.session_state.current_date_idx = all_dates.index(jump_date)
+            st.rerun()
+    else:
+        st.caption(f"⚠️ {selected_expiry} 前 7 天无可用快照")
+
+    if leaps_mode:
+        option_type = "Call"
+        st.caption("⚙️ LEAPS 模式：固定 Call，过滤 Delta 0.60-0.90")
+    else:
+        option_type = st.radio("期权类型", ["Call", "Put"])
 
 # ── 到期自动结算（在所有计算之前执行）─────────────────────────────────────────
 st.session_state.positions = auto_expire(
@@ -647,6 +950,10 @@ filtered = (
     .sort_values("strike")
     .reset_index(drop=True)
 )
+
+# LEAPS 模式：进一步收窄到 Delta 0.60-0.90 的深实值区
+if leaps_mode and not filtered.empty:
+    filtered = filtered[filtered["delta"].abs().between(0.60, 0.90)].reset_index(drop=True)
 
 # ── Main area ──────────────────────────────────────────────────────────────────
 st.title(f"{selected_ticker} 期权复盘工具")
@@ -732,9 +1039,10 @@ for tkr, sh in acct["shares"].items():
     shares_market_value += sh["qty"] * price
 
 shares_unrealized = sum(
-    sh["qty"] * (est_price - sh["cost_basis"])
+    lot["qty"] * (est_price - lot["price"])
     for tkr, sh in acct["shares"].items()
     if sh["qty"] > 0 and tkr == selected_ticker and est_price is not None
+    for lot in sh.get("lots", [{"qty": sh["qty"], "price": sh["cost_basis"]}])
 )
 
 total_equity = acct["cash"] + shares_market_value + sum(
@@ -778,41 +1086,350 @@ else:
 # ── 股票持仓 ────────────────────────────────────────────────────────────────
 if any(sh["qty"] > 0 for sh in acct["shares"].values()):
     st.subheader("股票持仓")
-    share_rows = []
+    lot_rows = []
     for tkr, sh in acct["shares"].items():
         if sh["qty"] <= 0:
             continue
         mkt_price = est_price if (tkr == selected_ticker and est_price) else None
-        mkt_val = sh["qty"] * mkt_price if mkt_price else None
-        unreal = (mkt_price - sh["cost_basis"]) * sh["qty"] if mkt_price else None
-        share_rows.append({
-            "标的": tkr,
-            "持有股数": sh["qty"],
-            "成本价": sh["cost_basis"],
-            "当前市价": mkt_price,
-            "市值": mkt_val,
-            "股票浮盈": unreal,
-        })
-    sh_df = pd.DataFrame(share_rows)
+        lots = sh.get("lots", [])
+        if lots:
+            for i, lot in enumerate(lots, 1):
+                lot_val = lot["qty"] * mkt_price if mkt_price else None
+                lot_pnl = (mkt_price - lot["price"]) * lot["qty"] if mkt_price else None
+                lot_rows.append({
+                    "标的": tkr,
+                    "批次": f"#{i}",
+                    "买入日": lot["date"],
+                    "该批股数": lot["qty"],
+                    "买入价/股": lot["price"],
+                    "当前市价": mkt_price,
+                    "该批市值": lot_val,
+                    "该批浮盈": lot_pnl,
+                })
+        else:
+            # 无 lots 记录时退化为单行（向后兼容）
+            mkt_val = sh["qty"] * mkt_price if mkt_price else None
+            unreal  = (mkt_price - sh["cost_basis"]) * sh["qty"] if mkt_price else None
+            lot_rows.append({
+                "标的": tkr,
+                "批次": "#1",
+                "买入日": "—",
+                "该批股数": sh["qty"],
+                "买入价/股": sh["cost_basis"],
+                "当前市价": mkt_price,
+                "该批市值": mkt_val,
+                "该批浮盈": unreal,
+            })
 
-    def color_share_pnl(val):
+    lot_df = pd.DataFrame(lot_rows)
+
+    def color_lot_pnl(val):
         if pd.isna(val):
             return ""
         return "color: #4CAF50; font-weight:bold" if val > 0 else "color: #F44336; font-weight:bold"
 
     st.dataframe(
-        sh_df.style
-        .map(color_share_pnl, subset=["股票浮盈"])
+        lot_df.style
+        .map(color_lot_pnl, subset=["该批浮盈"])
         .format({
-            "持有股数": "{:.0f}",
-            "成本价":   lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "当前市价": lambda v: f"${v:.2f}" if pd.notna(v) else "N/A",
-            "市值":     lambda v: f"${v:,.2f}" if pd.notna(v) else "—",
-            "股票浮盈": lambda v: f"${v:+,.2f}" if pd.notna(v) else "—",
+            "该批股数":  "{:.0f}",
+            "买入价/股": lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "当前市价":  lambda v: f"${v:.2f}" if pd.notna(v) else "N/A",
+            "该批市值":  lambda v: f"${v:,.2f}" if pd.notna(v) else "—",
+            "该批浮盈":  lambda v: f"${v:+,.2f}" if pd.notna(v) else "—",
         }),
         use_container_width=True,
         hide_index=True,
     )
+
+st.divider()
+
+# ── Positions & PnL ────────────────────────────────────────────────────────────
+st.subheader("当前持仓")
+
+if not st.session_state.positions:
+    st.info("暂无活跃持仓。")
+else:
+    rows = []
+    profit_take_candidates = []  # 锁定利润候选：≥50% 已实现的 Short 期权
+    any_estimated = False
+    for i, pos in enumerate(st.session_state.positions):
+        cur_mid, is_est = get_mid_smart(df, pos, selected_date, est_price)
+        if cur_mid is not None:
+            if is_est:
+                any_estimated = True
+            pnl = pos["direction"] * (cur_mid - pos["entry_mid"]) * CONTRACT_MULT * pos["qty"]
+            if pos["entry_mid"] > 0:
+                lock_pct = (pos["direction"] * (cur_mid - pos["entry_mid"])
+                            / pos["entry_mid"] * 100)
+            else:
+                lock_pct = None
+            # Short 期权 ≥ 50% 视为可锁定利润候选（estimated 价格的 Short 不参与，避免误触发）
+            if pos["direction"] == -1 and not is_est and lock_pct is not None and lock_pct >= 50:
+                profit_take_candidates.append((i, pos, cur_mid, lock_pct))
+        else:
+            pnl = None
+            lock_pct = None
+
+        dir_display = pos["dir_label"]
+        if pos.get("covered"):
+            dir_display += " 🛡️"
+        # 价格标记是否为估算
+        cur_mid_display = cur_mid
+        if cur_mid is not None and is_est:
+            dir_display += " ⋯"  # 估算标记
+        rows.append({
+            "标的": pos.get("ticker", selected_ticker),
+            "合约": f"${pos['strike']:.0f} {pos['type']}",
+            "方向": dir_display,
+            "张数": pos["qty"],
+            "入场价": pos["entry_mid"],
+            "当前价": cur_mid,
+            "PnL": pnl,
+            "锁定%": lock_pct,
+            "入场日": str(pos["entry_date"]),
+            "到期日": str(pos["expiry"]),
+        })
+
+    pos_df = pd.DataFrame(rows)
+
+    def color_pnl(val):
+        if pd.isna(val):
+            return ""
+        if val > 0:
+            return "color: #4CAF50; font-weight: bold"
+        if val < 0:
+            return "color: #F44336; font-weight: bold"
+        return ""
+
+    def color_lock_pct(val):
+        """≥80% 深绿粗体 / ≥50% 浅绿 / <0 红色"""
+        if pd.isna(val):
+            return ""
+        if val >= 80:
+            return "background-color: #C8E6C9; color: #1B5E20; font-weight: bold"
+        if val >= 50:
+            return "background-color: #E8F5E9; color: #2E7D32; font-weight: bold"
+        if val < 0:
+            return "color: #F44336"
+        return ""
+
+    styled_pos = (
+        pos_df.style
+        .map(color_pnl, subset=["PnL"])
+        .map(color_lock_pct, subset=["锁定%"])
+        .format({
+            "入场价": lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "当前价": lambda v: f"${v:.2f}" if pd.notna(v) else "—",
+            "PnL":    lambda v: f"${v:+.2f}" if pd.notna(v) else "—",
+            "锁定%":  lambda v: f"{v:+.1f}%" if pd.notna(v) else "—",
+        })
+    )
+    st.dataframe(styled_pos, use_container_width=True, hide_index=True)
+    if any_estimated:
+        st.caption(
+            "⋯ 标记：该合约当前 DTE 已跌出 LEAPS 数据过滤范围（>365 天），"
+            "当前价用 **intrinsic value** (max(spot−strike, 0)) 估算。"
+            "对深 ITM Long Call 误差通常 < 5%；如需精确价格请重抓数据放宽 DTE 下限。"
+        )
+
+    # ── 利润锁定建议（≥50% Short 期权一键回购）───────────────────────────
+    profit_take_close_idx = None
+    if profit_take_candidates:
+        st.success(
+            f"💰 **利润锁定建议**：{len(profit_take_candidates)} 个 Short 期权"
+            f"已锁定 ≥50% 利润，建议提前回购（避免到期前的尾部风险）"
+        )
+        pt_cols = st.columns(min(len(profit_take_candidates), 4))
+        for j, (orig_idx, pos, cur_mid, lock_pct) in enumerate(profit_take_candidates):
+            col = pt_cols[j % len(pt_cols)]
+            saved = (pos["entry_mid"] - cur_mid) * CONTRACT_MULT * pos["qty"]
+            btn_label = (f"💰 锁定 #{orig_idx}  ${pos['strike']:.0f} {pos['type']}\n"
+                         f"{lock_pct:.0f}%  +${saved:.0f}")
+            if col.button(btn_label, key=f"profit_take_{orig_idx}",
+                          use_container_width=True):
+                profit_take_close_idx = orig_idx
+
+    if profit_take_close_idx is not None:
+        pos = st.session_state.positions[profit_take_close_idx]
+        cur_mid = get_mid(df, pos["symbol"], selected_date)
+        close_position(st.session_state.account, pos, selected_date, cur_mid,
+                       action_label="利润锁定")
+        st.session_state.closed_positions.append(pos)
+        st.session_state.positions.pop(profit_take_close_idx)
+        st.rerun()
+
+    st.divider()
+    st.subheader("平仓操作")
+    close_cols = st.columns(min(len(st.session_state.positions), 4))
+    to_remove = None
+    for i, pos in enumerate(st.session_state.positions):
+        col = close_cols[i % len(close_cols)]
+        label = f"平仓 #{i}  ${pos['strike']:.0f} {pos['type']} ({pos['dir_label']})"
+        if col.button(label, key=f"close_{i}"):
+            to_remove = i
+
+    if to_remove is not None:
+        pos = st.session_state.positions[to_remove]
+        cur_mid, is_est = get_mid_smart(df, pos, selected_date, est_price)
+        if cur_mid is None:
+            st.warning(f"持仓 #{to_remove} 在 {selected_date} 无报价、且不能用 intrinsic 估算，无法平仓")
+        else:
+            if is_est:
+                st.info(f"⋯ 持仓 #{to_remove} 当天无盘口报价，按 intrinsic value ${cur_mid:.2f} 平仓（深 ITM Long 估算）")
+            close_position(st.session_state.account, pos, selected_date, cur_mid,
+                           action_label="手动平仓")
+            st.session_state.closed_positions.append(pos)
+            st.session_state.positions.pop(to_remove)
+            st.rerun()
+
+    # ── Roll Up & Out ──────────────────────────────────────────────────────────
+    short_positions = [(i, p) for i, p in enumerate(st.session_state.positions)
+                       if p["direction"] == -1]
+    if short_positions:
+        st.divider()
+        with st.expander("🔄 Roll Up & Out（一键展期）", expanded=False):
+            st.caption("一次完成：平仓回购老 Short + 新到期/新 Strike 开仓。"
+                       "Call → Roll Up（新 Strike ≥ 原 Strike）；Put → Roll Down（新 Strike ≤ 原 Strike）")
+
+            pos_labels = [
+                f"#{i}  ${p['strike']:.0f} {p['type']} {p.get('dir_label','Short')}"
+                f"{' 🛡️' if p.get('covered') else ''}  到期 {p['expiry']}"
+                for i, p in short_positions
+            ]
+            sel_idx_in_short = st.selectbox(
+                "选要 Roll 的 Short 持仓",
+                range(len(short_positions)),
+                format_func=lambda i: pos_labels[i],
+                key="roll_pos_select",
+            )
+            _, sel_pos = short_positions[sel_idx_in_short]
+
+            old_mid = get_mid(df, sel_pos["symbol"], selected_date)
+            if old_mid is None:
+                st.warning(f"原持仓在 {selected_date} 无报价，无法 Roll。")
+            else:
+                future_expiries = [e for e in sorted(day_df["expiry"].unique())
+                                   if e > sel_pos["expiry"]]
+                if not future_expiries:
+                    st.info(f"当前数据中没有晚于 {sel_pos['expiry']} 的到期日。")
+                else:
+                    new_expiry = st.selectbox(
+                        "新到期日（必须 > 原到期）",
+                        future_expiries,
+                        format_func=lambda d: f"{d}  (DTE {(d - selected_date).days})",
+                        key="roll_new_expiry",
+                    )
+
+                    roll_chain = (
+                        day_df[(day_df["expiry"] == new_expiry) &
+                               (day_df["type"] == sel_pos["type"])]
+                        .dropna(subset=["delta"])
+                        .sort_values("strike")
+                    )
+                    roll_chain = filter_liquid(roll_chain)  # 过滤 ghost quotes
+                    if sel_pos["type"] == "Call":
+                        roll_chain = roll_chain[roll_chain["strike"] >= sel_pos["strike"]]
+                    else:
+                        roll_chain = roll_chain[roll_chain["strike"] <= sel_pos["strike"]]
+
+                    if roll_chain.empty:
+                        direction_word = "更高" if sel_pos["type"] == "Call" else "更低"
+                        st.info(f"到期 {new_expiry} 无可用 {direction_word} Strike 合约。")
+                    else:
+                        roll_chain = roll_chain.copy()
+                        roll_chain["label"] = roll_chain.apply(
+                            lambda r: (f"${r['strike']:.0f} {r['type']} | "
+                                       f"Δ{r['delta']:+.2f} | mid ${r['mid']:.2f}"),
+                            axis=1,
+                        )
+
+                        # 注意：不能用 st.form —— form 内 widget 变化不重渲染，
+                        # 会导致切换"新合约"下拉框时预览金额不更新（用旧 mid 算出）。
+                        col1, col2 = st.columns([3, 1])
+                        new_label = col1.selectbox(
+                            "新合约",
+                            roll_chain["label"].tolist(),
+                            key="roll_new_strike",
+                        )
+                        new_qty = col2.number_input(
+                            "张数",
+                            min_value=1, max_value=int(sel_pos["qty"]),
+                            value=int(sel_pos["qty"]),
+                            key="roll_new_qty",
+                        )
+
+                        new_row = roll_chain[roll_chain["label"] == new_label].iloc[0]
+                        buyback_cost = old_mid * CONTRACT_MULT * sel_pos["qty"]
+                        new_premium = float(new_row["mid"]) * CONTRACT_MULT * int(new_qty)
+                        net_credit = new_premium - buyback_cost
+
+                        mark = "🟢" if net_credit >= 0 else "🔴"
+                        verdict = "credit" if net_credit >= 0 else "debit"
+                        st.markdown(
+                            f"**预览**: 回购 -${buyback_cost:,.2f}  +  "
+                            f"新开仓 +${new_premium:,.2f}  =  "
+                            f"{mark} 净 {verdict} **${net_credit:+,.2f}**"
+                        )
+
+                        roll_submit = st.button(
+                            "🔄 执行 Roll", use_container_width=True,
+                            key="roll_submit_btn",
+                        )
+                        if roll_submit:
+                                # 1. 平掉老仓
+                                close_position(
+                                    st.session_state.account, sel_pos,
+                                    selected_date, old_mid,
+                                    action_label="Roll 平仓",
+                                )
+                                st.session_state.closed_positions.append(sel_pos)
+                                for i, p in enumerate(st.session_state.positions):
+                                    if p is sel_pos:
+                                        st.session_state.positions.pop(i)
+                                        break
+
+                                # 2. 开新仓
+                                new_pos = {
+                                    "ticker":     sel_pos["ticker"],
+                                    "symbol":     new_row["option_symbol"],
+                                    "strike":     float(new_row["strike"]),
+                                    "type":       sel_pos["type"],
+                                    "expiry":     new_row["expiry"],
+                                    "direction":  -1,
+                                    "dir_label":  "Short",
+                                    "qty":        int(new_qty),
+                                    "entry_mid":  float(new_row["mid"]),
+                                    "entry_date": selected_date,
+                                }
+                                # 继承 covered 标记（若仍有足够正股）
+                                if sel_pos.get("covered"):
+                                    avail = get_available_shares(
+                                        st.session_state.account,
+                                        st.session_state.positions,
+                                        sel_pos["ticker"],
+                                    )
+                                    if avail >= int(new_qty) * CONTRACT_MULT:
+                                        new_pos["covered"] = True
+
+                                open_position(
+                                    st.session_state.account, new_pos,
+                                    selected_date, float(new_row["mid"]),
+                                )
+                                st.session_state.positions.append(new_pos)
+
+                                # 3. history 最后两条加 [Roll] 标记
+                                hist = st.session_state.account["history"]
+                                if len(hist) >= 2:
+                                    for h in hist[-2:]:
+                                        h["note"] = f"[Roll] {h['note']}"
+
+                                st.success(
+                                    f"已 Roll: ${sel_pos['strike']:.0f}@{sel_pos['expiry']} "
+                                    f"→ ${new_row['strike']:.0f}@{new_expiry}  "
+                                    f"净 {verdict} ${net_credit:+,.2f}"
+                                )
+                                st.rerun()
 
 st.divider()
 
@@ -836,8 +1453,23 @@ def style_delta(val):
     return "color: #2196F3" if val > 0 else "color: #F44336"
 
 
+def highlight_chain_row(row):
+    """优先级：流动性灰显 > Delta<0.10 橙色警告 > Delta 0.75-0.85 绿色甜区（LEAPS）"""
+    liq = (row["Volume"] if pd.notna(row["Volume"]) else 0) + \
+          (row["OI"]     if pd.notna(row["OI"])     else 0)
+    if liq < LIQUIDITY_MIN:
+        return ["background-color: #F5F5F5; color: #9E9E9E"] * len(row)
+    delta_abs = abs(row["Delta"]) if pd.notna(row["Delta"]) else 1.0
+    if delta_abs < 0.10:
+        return ["background-color: #FFF3E0; color: #E65100"] * len(row)
+    if 0.75 <= delta_abs <= 0.85:
+        return ["background-color: #E8F5E9; color: #1B5E20; font-weight: 600"] * len(row)
+    return [""] * len(row)
+
+
 styled = (
     chain_display.style
+    .apply(highlight_chain_row, axis=1)
     .map(style_delta, subset=["Delta"])
     .format({
         "Strike": "{:.1f}", "Mid": "{:.2f}", "Bid": "{:.2f}", "Ask": "{:.2f}",
@@ -846,6 +1478,69 @@ styled = (
     })
 )
 st.dataframe(styled, use_container_width=True, hide_index=True)
+st.caption(
+    f"ℹ️ 灰色行 = Volume+OI < {LIQUIDITY_MIN} 的 ghost quote，已从选择器排除。"
+    "  橙色行 = Delta < 0.10，远 OTM 区域价格可能失真（多个行权价 mid 相同），建议回避。"
+    "  绿色行 = Delta 0.75-0.85 LEAPS 甜区（深实值 Long Call 推荐区间）。"
+)
+
+# ── 🚀 一键买入最优 LEAPS（仅 LEAPS 模式可见）─────────────────────────────────
+if leaps_mode and option_type == "Call":
+    leaps_pool = (
+        filter_liquid(filtered.dropna(subset=["delta"]))
+        .copy()
+    )
+    if not leaps_pool.empty:
+        # 选 Delta 最接近 0.80 的合约（深实值首选）
+        leaps_pool["_dist"] = (leaps_pool["delta"].abs() - 0.80).abs()
+        best = leaps_pool.sort_values("_dist").iloc[0]
+        dte_days = (selected_expiry - selected_date).days
+        cost_per = float(best["mid"]) * CONTRACT_MULT
+        leaps_cols = st.columns([2, 1, 1])
+        with leaps_cols[0]:
+            st.success(
+                f"🎯 **最优 LEAPS 候选**: ${best['strike']:.0f} Call  "
+                f"Δ{best['delta']:+.3f}  mid ${best['mid']:.2f}  "
+                f"DTE {dte_days}  Vol {int(best['volume'] or 0)} / OI {int(best['open_interest'] or 0)}"
+            )
+        with leaps_cols[1]:
+            leaps_qty = st.number_input(
+                "张数", min_value=1, max_value=20, value=1, key="leaps_qty",
+                help=f"每张成本 ≈ ${cost_per:,.2f}"
+            )
+        with leaps_cols[2]:
+            total_cost = cost_per * int(leaps_qty)
+            can_afford = acct["cash"] >= total_cost
+            if st.button(
+                f"🚀 买入 {int(leaps_qty)} 张\n-${total_cost:,.0f}",
+                use_container_width=True,
+                disabled=not can_afford,
+                key="leaps_buy_btn",
+                help="按当前 mid 直接 Long 开仓 LEAPS（深实值 Call，长期持有替代正股）",
+            ):
+                new_pos = {
+                    "ticker":     selected_ticker,
+                    "symbol":     best["option_symbol"],
+                    "strike":     float(best["strike"]),
+                    "type":       "Call",
+                    "expiry":     best["expiry"],
+                    "direction":  1,
+                    "dir_label":  "Long",
+                    "qty":        int(leaps_qty),
+                    "entry_mid":  float(best["mid"]),
+                    "entry_date": selected_date,
+                }
+                open_position(acct, new_pos, selected_date, float(best["mid"]))
+                st.session_state.positions.append(new_pos)
+                st.success(
+                    f"✅ 已买入 {int(leaps_qty)} 张 ${best['strike']:.0f} Call @ ${best['mid']:.2f}，"
+                    f"现金支出 ${total_cost:,.2f}"
+                )
+                st.rerun()
+            if not can_afford:
+                st.caption(f"⚠️ 现金不足（需 ${total_cost:,.0f}，余 ${acct['cash']:,.0f}）")
+    else:
+        st.info("当前过滤条件下无可交易 LEAPS 合约（已剔除流动性不足）。")
 
 st.divider()
 
@@ -882,6 +1577,7 @@ if held_shares > 0:
             .dropna(subset=["delta"])
             .sort_values("strike")
         )
+        cc_chain = filter_liquid(cc_chain)  # 过滤 ghost quotes
         # 典型 CC 用 OTM Call，过滤 strike >= 当前股价（允许 ATM）
         if est_price is not None:
             cc_chain = cc_chain[cc_chain["strike"] >= est_price]
@@ -941,7 +1637,7 @@ st.subheader("虚拟建仓")
 if filtered.empty:
     st.info("当前过滤条件下无合约，请调整日期/到期日/类型。")
 else:
-    chain_for_entry = filtered.dropna(subset=["delta"]).copy()
+    chain_for_entry = filter_liquid(filtered.dropna(subset=["delta"])).copy()
     chain_for_entry["label"] = chain_for_entry.apply(
         lambda r: f"${r['strike']:.0f} {r['type']} | Δ{r['delta']:+.2f} | mid ${r['mid']:.2f}",
         axis=1,
@@ -984,81 +1680,6 @@ else:
             st.session_state.positions.append(new_pos)
             covered_tag = " 🛡️" if new_pos.get("covered") else ""
             st.success(f"已加入：{selected_label}  {dir_label} x{qty}{covered_tag}")
-            st.rerun()
-
-st.divider()
-
-# ── Positions & PnL ────────────────────────────────────────────────────────────
-st.subheader("当前持仓")
-
-if not st.session_state.positions:
-    st.info("暂无活跃持仓。")
-else:
-    rows = []
-    for pos in st.session_state.positions:
-        cur_mid = get_mid(df, pos["symbol"], selected_date)
-        if cur_mid is not None:
-            pnl = pos["direction"] * (cur_mid - pos["entry_mid"]) * CONTRACT_MULT * pos["qty"]
-        else:
-            pnl = None
-
-        dir_display = pos["dir_label"]
-        if pos.get("covered"):
-            dir_display += " 🛡️"
-        rows.append({
-            "标的": pos.get("ticker", selected_ticker),
-            "合约": f"${pos['strike']:.0f} {pos['type']}",
-            "方向": dir_display,
-            "张数": pos["qty"],
-            "入场价": pos["entry_mid"],
-            "当前价": cur_mid,
-            "PnL": pnl,
-            "入场日": str(pos["entry_date"]),
-            "到期日": str(pos["expiry"]),
-        })
-
-    pos_df = pd.DataFrame(rows)
-
-    def color_pnl(val):
-        if pd.isna(val):
-            return ""
-        if val > 0:
-            return "color: #4CAF50; font-weight: bold"
-        if val < 0:
-            return "color: #F44336; font-weight: bold"
-        return ""
-
-    styled_pos = (
-        pos_df.style
-        .map(color_pnl, subset=["PnL"])
-        .format({
-            "入场价": lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "当前价": lambda v: f"${v:.2f}" if pd.notna(v) else "—",
-            "PnL":    lambda v: f"${v:+.2f}" if pd.notna(v) else "—",
-        })
-    )
-    st.dataframe(styled_pos, use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("平仓操作")
-    close_cols = st.columns(min(len(st.session_state.positions), 4))
-    to_remove = None
-    for i, pos in enumerate(st.session_state.positions):
-        col = close_cols[i % len(close_cols)]
-        label = f"平仓 #{i}  ${pos['strike']:.0f} {pos['type']} ({pos['dir_label']})"
-        if col.button(label, key=f"close_{i}"):
-            to_remove = i
-
-    if to_remove is not None:
-        pos = st.session_state.positions[to_remove]
-        cur_mid = get_mid(df, pos["symbol"], selected_date)
-        if cur_mid is None:
-            st.warning(f"持仓 #{to_remove} 在 {selected_date} 无报价，无法平仓")
-        else:
-            close_position(st.session_state.account, pos, selected_date, cur_mid,
-                           action_label="手动平仓")
-            st.session_state.closed_positions.append(pos)
-            st.session_state.positions.pop(to_remove)
             st.rerun()
 
 st.divider()

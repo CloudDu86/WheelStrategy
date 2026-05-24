@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from IPython.display import HTML, display
 
 qb     = QuantBook()
-TICKER = "TQQQ"
+TICKER = "VOO"
 
 equity = qb.AddEquity(TICKER, Resolution.Hour)
 equity.SetDataNormalizationMode(DataNormalizationMode.Raw)
@@ -17,10 +17,10 @@ equity.SetDataNormalizationMode(DataNormalizationMode.Raw)
 option = qb.AddOption(TICKER, Resolution.Minute)
 option.SetFilter(lambda u: u
     .IncludeWeeklys()
-    .Strikes(-5, 5)
-    .Expiration(1, 45))
+    .Strikes(-15, 15)     # VOO 价格高、strike 间距大，需要更宽
+    .Expiration(1, 60))   # CC 操作覆盖 30-45 DTE，上限扩到 60
 
-STORE_KEY = f"{TICKER}_options_20230101_20231231_greeks.csv"
+STORE_KEY = f"{TICKER}_options_20220101_20251231_greeks.csv"
 SAVE_PATH = os.path.join("Output", STORE_KEY)
 
 print(f"订阅完成: {TICKER}")
@@ -28,8 +28,8 @@ print(f"当前时间: {qb.Time}")
 
 
 # ── Cell 2：获取交易日列表 ──────────────────────────────────────────────────────
-start_time = datetime(2023, 1, 1)
-end_time   = datetime(2023, 12, 31)
+start_time = datetime(2022, 1, 1)
+end_time   = datetime(2025, 12, 31)
 
 print(f"数据区间: {start_time.date()} → {end_time.date()}")
 
@@ -62,8 +62,8 @@ for dt in trade_dates:
             g   = contract.Greeks
 
             # ── 车轮策略过滤条件 ───────────────────────────────────────────
-            # 只保留 DTE 7-45 的合约（排除当天到期和过远到期）
-            if not (7 <= dte <= 45):
+            # 保留 DTE 1-60 的合约：DTE<7 用于 Roll Up & Out 取最后一周报价
+            if not (1 <= dte <= 60):
                 continue
             # 只保留 delta 在有效范围内的合约
             if g:

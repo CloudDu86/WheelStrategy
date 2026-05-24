@@ -1,226 +1,393 @@
 # Project Handover — 指数+期权双轨交易轮动系统
 
-**最后更新**: 2026-04-29 (v3)  
-**平台**: QuantConnect Cloud (Free 账户)  
-**用户**: Du Guanyun (cloudmori86@gmail.com)  
+**最后更新**: 2026-05-21 (**v5** — LEAPS 模块上线 + Time Machine + 批次成本 + intrinsic fallback)
+**平台**: QuantConnect Cloud (Free 账户) + 本地 Streamlit Dashboard
+**用户**: Du Guanyun (cloudmori86@gmail.com)
 **工作目录**: `D:\Claude_Code\QuantConnect\`
+**GitHub**: https://github.com/CloudDu86/WheelStrategy
 
 ---
 
 ## 一、策略概述
 
-**策略名**: 指数+期权双轨交易轮动系统（QQQ / TQQQ / QQQM）
+**策略名**: 指数+期权双轨交易轮动系统（QQQ / TQQQ / QQQM）+ VOO Covered Call 收租 + QQQ LEAPS 多头加速
 
 | 标的 | 用途 |
 |------|------|
-| QQQ | 技术信号基准（200MA + RSI）+ 买入 LEAPS |
+| QQQ | 技术信号基准（200MA + RSI）+ **★ 买入 LEAPS（深 ITM Long Call Δ≈0.80）** |
 | TQQQ | 车轮策略核心（卖 CSP → 被行权 → 卖 CC → 被 Call 走 → 重启） |
 | QQQM | 长期底仓（50%仓位，低费率） |
+| **VOO** | **实盘 SBI 持仓 159 股 @ ~$430**，目标用 CC 月度收租 |
 
 **开仓三重信号**（需同时满足）：
 1. QQQ > 200日均线（牛市）
 2. QQQ RSI < 50（短期买盘枯竭）
 3. 当天收阴线
 
-**防守信号**: QQQ 跌破 200MA → 立刻平仓或卖深度 ITM Call  
+**防守信号**: QQQ 跌破 200MA → 立刻平仓或卖深度 ITM Call
 **抄底信号**: VIX ≥ 30 → 动用 10% 备用金加仓 QQQM
 
-**仓位配比**（"年龄+20"法则，以 30 岁为例）：
-- 50% QQQM 底仓
-- 10% 现金备用（VIX ≥ 30 时动用）
-- 32% TQQQ 车轮策略（CSP / CC）
-- 8% QQQ LEAPS（Delta ~0.8，~2年到期，深度实值）
+**仓位配比修订建议**（基于 v5 日本税务分析，30 岁，¥1000 万级别）：
+- 45% 株（VOO/eMAXIS S&P500 — 比 Gemini 建议多保 5% 避税）
+- 13% 现金（比 HANDOVER 原 10% +3%，保证 TQQQ 全行权能接货）
+- 12% TQQQ 车轮（起步档，半年验证后再加到 18-20%）
+- 10% 金 / 10% 债与高配当
+- 5% QQQ LEAPS（Δ≈0.80，2 年到期）
+- 2.5% SOXL / 2.5% LABU（高波突击队，定期再平衡）
 
 ---
 
 ## 二、当前进度
 
-### ✅ 已完成
-1. **Research Notebook 开通** — 在 QuantConnect Algorithm Lab 项目 "Formal Black Alpaca" 内创建了 `research.ipynb`
-2. **QQQ 期权数据抓取** — 2026-02-01 → 2026-03-16，25,066 行含 Greeks，已存入 `data/`
-3. **TQQQ 期权数据抓取** — 2026-02-01 → 2026-04-17，13,204 行含 Greeks，已存入 `data/`
-4. **TQQQ 2022 全年数据抓取** — 2022-01-03 → 2022-12-30，60,333 行含 Greeks，已存入 `data/`
-5. **数据质量确认** — delta/IV 100% 非空；bid=ask 为 QC 历史回放限制，建仓用 `mid × 0.95` 估算滑点；Theta 为年化值需 ÷365
-6. **期权复盘工具 V1** — `options_dashboard.py` Streamlit 看板，支持虚拟建仓/平仓/到期结算/权益曲线
-7. **期权复盘工具 V2（备兑卖出）** — 新增 🛡️ 备兑卖出 Call 专区、`get_available_shares()`、Short Call ITM 备兑结算
-8. **期权复盘工具 V3（正股直买 + 动态成本）** — 新增"🛒 买入100股"按钮、动态成本/股指标（公式：(买股支出-累计权利金)÷持股数）、重置账户按钮
-9. **本地车轮策略闭环验证** — 跑通完整一轮：Short Put → 被行权 → 4轮 CC → 最终被 Call 走，净盈亏 +$237.50
-10. **QC PnL 验证脚本（wheel_replay_qc.py）** — 2022 全年 TQQQ 车轮，11笔硬编码流水，验证 QC 现金 = $6,744
-11. **QC 验证结论** — QC 回测因 Early Assignment（提前行权）× 2 次导致 200 股 × $45 = $9,000 支出（本地预期 $4,500），差异 $4,500；硬编码对照方案已放弃，改用本地 Streamlit 验证
-12. **CCB 工具（ccb.py）** — Gemini × Claude Code 协作桥接工具，自动加载 HANDOVER.md 作为项目背景，用 `gemini-2.5-pro` 分析后将结果传递给 Claude Code
-13. **Gemini 2022 数据分析** — 发现 3 个关键数据陷阱（见下方"数据陷阱"章节）
+### ✅ v5 完成项（本轮新增 ★）
 
-### 🔲 待完成
-1. **options_dashboard.py 拆股复权** — 2022-01-13 TQQQ 2:1 拆股，跨越该日期的持仓 Strike ÷2、qty ×2、成本 ÷2
-2. **main.py CC 防割肉逻辑** — `if CC_Strike < avg_cost: skip`，禁止在深套时贱卖 Call
-3. **QuantConnect main.py 回测** — 在 Algorithm Lab 运行完整车轮策略回测（2021-2024）
-4. **保证金冻结（V4）** — `account["collateral"]` 占位，未真正扣除 `strike × 100`
-5. **QQQ 数据延伸** — 当前只到 2026-03-16，可重跑 `research_qqq_options.py` 补充到 2026-04-17
+**Dashboard 功能（options_dashboard.py，~1700 行）**
+
+`数据层`
+1. ★ **文件扫描器扩展**：接受 `_options_` 和 `_LEAPS_` 两类命名，下拉显示 `[options]/[LEAPS]` 前缀
+2. ★ **intrinsic value fallback (`get_mid_smart`)**：合约报价缺失时（如 LEAPS DTE 跌出过滤范围）自动用 `max(spot-strike, 0)` 估算 Long 仓位当前价。Short 不估算（不安全）。
+3. ★ **批次独立成本追踪 (lot-level tracking)**：每次买入/被行权追加一个 `lot` 记录，含 qty/price/date。Short Call 行权时按 **FIFO** 消耗最早批次。
+4. ★ **股票持仓 UI**：从加权平均成本表改为**每批次独立一行**显示
+
+`期权链层`
+5. ★ **🚀 LEAPS 模式**侧边栏开关 — 自动过滤 Call + DTE>365 + Delta 0.6-0.9
+6. ★ **Delta 甜区高亮**：链表中 Δ 绝对值 0.75-0.85 行绿色加粗
+7. ★ **Delta < 0.10 软警告**：远 OTM 价格易失真（多个行权价 mid 相同）→ 橙色背景
+8. ★ **一键买入最优 LEAPS**：自动按 Δ≈0.80 选合约 + 限价支付
+
+`时间控制`
+9. ★ **⏰ Time Machine**：回放历史到任意日期，重建账户/持仓/批次/权利金状态（基于 history 重放，端点精确对齐）。支持「返回现在」一键恢复。
+10. ★ **「跳到期日」改造**：到期日不在快照范围内时自动取最近 ≤ 到期日的快照
+11. ★ **「跳到期日 1 周之前」按钮**：辅助 Roll Up & Out 收租时机检视
+
+`持仓 UI`
+12. ★ **「当前持仓」移到顶部**：放在「股票持仓」下方、期权链之前，开 LEAPS 仓位后**滚动一屏内可见**
+13. ★ **平仓支持 intrinsic fallback**：无报价时按 intrinsic 价平仓（提示 ⋯ 标记）
+14. ★ **Roll Up & Out 预览实时刷新**：去掉 `st.form` 包裹，切换新合约时立即重算 net credit（之前因 form 不重渲染显示错误金额）
+
+**数据抓取脚本**
+15. ★ **`research_qqq_leaps.py`** — QQQ LEAPS 8 年数据脚本（2018-2025，DTE 30-900，Delta 0.50-0.95，仅 Call）
+16. ★ **`research_voo_leaps.py`** — VOO LEAPS 备用脚本（未跑）
+17. ★ **纯 ASCII 设计**：避免 QC Notebook API 拒绝 emoji 导致无法保存
+18. ★ **ObjectStore Save 软失败**：QC Free 50MB 上限超时不阻断，Cell 5 仍可下载
+
+**新数据集**
+19. ★ **QQQ_LEAPS_20180101_20251231_greeks.csv** — 37.45 MB / 326,624 行 / 8 年覆盖
+
+### 🔲 v5 后续待办
+
+1. **VOO 4 年 CC 模拟跑完** — 月度循环约 48 次，对比 B&H（含分红补偿 +6%）
+2. **TQQQ 拆股复权** — 2022-01-13 TQQQ 2:1 拆股，跨日持仓 Strike ÷2、qty ×2
+3. **main.py CC 防割肉逻辑** — `if CC_Strike < avg_cost: skip`
+4. **QuantConnect main.py 回测**（2021-2024）
+5. **保证金冻结 V5** — `collateral` 改为真实 `strike × 100` 扣减
+6. **VOO LEAPS 数据抓取**（可选）— `research_voo_leaps.py` 已就绪，未执行
+7. **Δ > 0.95 LEAPS 边界数据**（可选）— 当前 LEAPS 数据 Δ 上限 0.95，超深 ITM 会丢；intrinsic fallback 已可应对，但若需精确价格需重抓时把上限改 0.99
+8. **Roll Up & Out 收租实测**（VOO 4 年场景），目标永不被 Call 走
 
 ---
 
 ## 三、关键文件清单
 
-| 文件 | 位置 | 说明 |
+### 代码文件（项目根目录）
+
+| 文件 | 大小 | 说明 |
 |------|------|------|
-| `main.py` | QuantConnect Algorithm Lab | 完整车轮策略回测（2021-2024），待运行 |
-| `wheel_replay_qc.py` | `D:\Claude_Code\QuantConnect\` | QC PnL 验证脚本（2022 全年 TQQQ，11笔流水） |
-| `wheel_verify_notebook.py` | `D:\Claude_Code\QuantConnect\` | Research Notebook 版验证脚本（读 Object Store CSV） |
-| `ccb.py` | `D:\Claude_Code\QuantConnect\` | Gemini × Claude Code 协作桥接工具 |
-| `research.ipynb` | QuantConnect Research Notebook | Jupyter 数据探索环境 |
-| `research_qqq_options.py` | `D:\Claude_Code\QuantConnect\` | 数据抓取脚本（当前配置为 TQQQ，2026-02-01→04-17） |
-| `options_dashboard.py` | `D:\Claude_Code\QuantConnect\` | Streamlit 期权复盘工具 V3（含备兑卖出、正股直买、动态成本） |
-| `data\QQQ_options_20260201_20260316_greeks.csv` | `data\` | QQQ 期权数据，25,066 行，含 Greeks |
-| `data\TQQQ_options_20260201_20260417_greeks.csv` | `data\` | TQQQ 期权数据（2026），13,204 行，含 Greeks |
-| `data\TQQQ_options_20220201_20221231_greeks.csv` | `data\` | TQQQ 期权数据（2022 全年），60,333 行，含 Greeks |
-| `data\Simulator\2026-04-23T03-11_export.csv` | `data\Simulator\` | 2022 全年车轮流水导出（GBK 编码），11笔交易 |
-| `gemini_analysis.md` | `D:\Claude_Code\QuantConnect\` | Gemini 2.5 Pro 对 2022 数据的分析报告 |
+| `options_dashboard.py` | 75 KB | **Streamlit 复盘工具 v5**（~1700 行） |
+| `research_qqq_options.py` | 8 KB | 短期期权抓取脚本（VOO 模板，DTE 1-60） |
+| `research_qqq_leaps.py` | 11 KB | **★ QQQ LEAPS 抓取脚本 v2**（DTE 30-900，纯 ASCII） |
+| `research_voo_leaps.py` | 11 KB | VOO LEAPS 抓取脚本（备用，未跑） |
+| `csv_to_workspace.py` | 5 KB | CSV 流水 → JSON workspace 转换器 |
+| `main.py` | 22 KB | QC Algorithm 完整车轮回测（未运行） |
+| `wheel_replay_qc.py` | 8 KB | QC PnL 验证 notebook 脚本 |
+| `wheel_verify_notebook.py` | 9 KB | QC 验证脚本 |
+| `ccb.py` | 15 KB | Gemini × Claude Code 协作桥 |
+
+### 数据文件（data/）
+
+| 文件 | 大小 | 行数 | 说明 |
+|------|------|------|------|
+| **QQQ_LEAPS_20180101_20251231_greeks.csv** | **37.45 MB** | **326,624** | **★ QQQ LEAPS 8 年 (DTE 30-900, Δ 0.50-0.95, Call only)** |
+| VOO_options_20220101_20251231_greeks.csv | 14.28 MB | 133,562 | VOO 4 年（2022-2025），DTE 7-60 |
+| TQQQ_options_20220201_20221231_greeks.csv | 6.61 MB | 60,333 | TQQQ 2022 全年 |
+| TQQQ_options_20230101_20231231_greeks.csv | 4.89 MB | 44,658 | TQQQ 2023 全年 |
+
+### Workspace JSON (data/Simulator/)
+
+| 文件 | 说明 |
+|------|------|
+| `workspace_VOO_initial.json` | VOO 模拟起始状态（159 股 @ $430，现金 $31,630） |
+| `workspace_VOO_2026-05-15.json` | VOO 复盘进展（5 笔 closed） |
+| `workspace_VOO_2023_2026.json` | VOO 完整 4 年复盘存档（38 笔 closed, +$14,385，胜率 86.8%） |
+| `workspace_TQQQ_20231215.json` | TQQQ 2 年完整 Wheel 存档（+43.9%） |
+| `workspace_TQQQ_2026-05-02.json` | TQQQ 2026 测试 |
+| `workspace_QQQLeaps_2026-05-21.json` | **★ 新增** QQQ LEAPS 复盘起始 |
 
 ---
 
-## 四、options_dashboard.py 功能说明
+## 四、options_dashboard.py v5 功能详解
 
 ```bash
 streamlit run options_dashboard.py
 ```
 
-### 已实现功能
-| 功能 | 说明 |
-|------|------|
-| QQQ / TQQQ 切换 | 侧边栏 radio，切换时自动清空持仓和账户 |
-| 初始资金设置 | 默认 $10,000，可调，修改后重置账户 |
-| 时间控制 | 侧边栏 slider + 主界面 ⏪-1日 / ⏭+1日 / ⏩+1周 / 📅跳到到期日 |
-| 账户概览 | 初始资金 / 可用现金 / 已实现PnL / 未实现PnL / 总权益 |
-| 股票持仓 | ITM 行权后显示正股持仓、成本价、市值、浮盈 |
-| 期权链 | delta 蓝/红着色，含 Greeks 和 IV |
-| 虚拟建仓 | Short/Long，自动更新账户现金；Short Call 有足量正股时自动标记备兑 |
-| 🛡️ 备兑卖出专区 | 持股时显示；独立到期日选择器；可用股数/已锁定实时显示；张数上限自动计算 |
-| 自动到期结算 | Short Put ITM → 买入正股；Short Call ITM 备兑 → 卖出正股收回现金；OTM → 权利金全额实现 |
-| 合并权益曲线 | 所有持仓的权益随时间变化图 |
-| 交易流水 | 可折叠，显示所有开仓/平仓/到期事件 |
+### 4.1 数据加载（扩展为支持 LEAPS）
 
-### PnL 公式（重要）
+文件命名规则：
+- `TICKER_options_<period>_greeks.csv` — 短期 CC/CSP 数据
+- `TICKER_LEAPS_<period>_greeks.csv` — 深 ITM 长期 LEAPS 数据
+
+下拉显示：`[options] 20220101 → 20251231` / `[LEAPS] 20180101 → 20251231`
+
+### 4.2 主区段顺序（v5 重排）
+
 ```
-pnl = direction × (cur_mid - entry_mid) × 100 × qty
-# Short direction = -1：mid 下降 → PnL 为正（卖方获利）
-# Long  direction = +1：mid 上升 → PnL 为正（买方获利）
-```
-
-### 到期结算逻辑
-```python
-# Short Put ITM（最常见车轮场景）
-cash -= strike × 100 × qty          # 买入正股
-shares[ticker] += 100 × qty          # 正股入账
-realized_pnl += entry_mid × 100 × qty  # 权利金全额实现
-
-# Short Put OTM
-realized_pnl += entry_mid × 100 × qty  # 权利金全额实现，无现金变化
-
-# ITM 内在价值用标的价推算，避免到期日 bid-ask 失真：
-# Put value = max(0, strike - spot)
-# Call value = max(0, spot - strike)
+账户概览
+   ↓
+股票持仓（lot 级别表，每批次独立一行）
+   ↓
+当前持仓（v5: 移到这里，包括平仓/Roll Up/利润锁定 操作）
+   ↓
+期权链 (LEAPS 模式开启时自动过滤 Call + DTE>365 + Δ 0.6-0.9)
+   ↓
+🚀 一键买入最优 LEAPS（仅 LEAPS 模式可见）
+   ↓
+🛡️ 备兑卖出 Call（持有股票时自动出现，与 LEAPS 模式互不冲突）
+   ↓
+虚拟建仓
+   ↓
+总权益曲线
 ```
 
-### 已知限制（V1）
-- `bid = ask`：数据源限制，建仓请心算 `mid × 0.95` 作为实际成交价
-- 无保证金冻结：裸卖 Put 不扣保证金，V2 补充 `strike × 100 × qty`
-- 跨标的股票市价：持有 QQQ 股票时切换到 TQQQ 界面，股票显示成本价而非市价
-
----
-
-## 五、QuantConnect 平台限制（Free 账户）
-
-| 限制 | 说明 |
-|------|------|
-| 无 API 访问 | 不能用 REST API 读写 Object Store |
-| 10KB 日志/天 | main.py 回测日志需精简 |
-| Object Store | 可在 Notebook/Algorithm 内读写，无 UI 下载入口 |
-
-**Object Store 键名**:
-- `QQQ_options_20260201_20260316_greeks.csv`
-- `TQQQ_options_20260201_20260417_greeks.csv`
-
----
-
-## 六、`research_qqq_options.py` 关键逻辑
+### 4.3 ⏰ Time Machine（v5 新增）
 
 ```python
-# 当前配置（最后一次修改）
-TICKER    = "TQQQ"
-start_time = datetime(2026, 2, 1)
-end_time   = datetime(2026, 4, 17)
-STORE_KEY  = "TQQQ_options_20260201_20260417_greeks.csv"
+def rewind_to_date(initial_capital, history, positions, closed_positions, target_date):
+    """从 history 重放到 target_date，端点精确还原账户+仓位+批次状态"""
+```
 
-# Greeks 获取方式（核心）
-qb.SetDateTime(datetime(dt.year, dt.month, dt.day, 15, 45))
-chain = qb.OptionChain(option.Symbol)   # OptionHistory() 不含 Greeks
+- 侧边栏「⏰ 时间机器」区块，date 选择 + 「回到该日」/「返回现在」按钮
+- 自动备份 `_tm_snapshot`，可一键恢复
+- 已关闭仓位若 close_date > target 会"复活"为 open 仓
+- 验证：用 2025-01-01 作为 target 跑出来的现金/股数/realized 与原始 JSON 完全一致
 
-# 车轮策略过滤
-if not (7 <= dte <= 45): continue
-if delta_abs < 0.05 or delta_abs > 0.60: continue
+### 4.4 intrinsic value fallback（v5 新增）
+
+```python
+def get_mid_smart(df, pos, d, spot) -> tuple[float | None, bool]:
+    """报价缺失时对 Long 仓位用 intrinsic value 估算。Short 不估算（不安全）。
+    返回 (value, is_estimated)。"""
+```
+
+**应用场景**：LEAPS 持仓 DTE 跌出当前数据过滤范围（30-900）或 Δ 超出 0.50-0.95
+**误差**：深 ITM (Δ>0.95) 误差 < 2%；中 ITM (Δ 0.5-0.8) 误差 5-10%
+**UI 标记**：估算价仓位方向列加 ⋯ 标记 + 表下方 caption 说明
+
+### 4.5 批次成本追踪（v5 新增）
+
+```python
+shares[ticker] = {
+    "qty": 200,
+    "cost_basis": 425.0,                      # 加权平均（兼容字段）
+    "lots": [
+        {"qty": 100, "price": 430.0, "date": "2024-03-15"},
+        {"qty": 100, "price": 420.0, "date": "2025-05-23"},
+    ]
+}
+```
+
+- `_add_lot()`：每次买入/被行权追加批次
+- `_sell_lots_fifo()`：Short Call 备兑结算时 FIFO 消耗，返回真实成本（不是平均成本）
+- 向后兼容：旧 workspace JSON 无 `lots` 字段时自动合成单一批次
+
+### 4.6 PnL / 现金流公式（不变）
+
+```
+pnl       = direction × (cur_mid - entry_mid) × 100 × qty
+开仓现金流 = -direction × mid × 100 × qty   (Short 收入 / Long 支出)
+平仓现金流 = +direction × mid × 100 × qty   (Short 买回支出 / Long 卖出收入)
 ```
 
 ---
 
-## 七、`main.py` 车轮策略回测说明
+## 五、市场客观限制（数据抓取必读）
 
-- **回测区间**: 2021-01-04 → 2024-12-31
-- **状态机**: `SEEK_CSP` → `SHORT_PUT` → `LONG_TQQQ` → `SHORT_CALL` → 循环
-- **CSP 参数**: Delta ~0.25，DTE 21-45
-- **CC 参数**: 牛市 Delta ~0.30，熊市 Delta ~0.65（深度 ITM 保护）
-- **LEAPS**: QQQ Call，Delta ~0.80，~2年到期
-- **VIX 抄底**: `AddIndex("VIX")` — 触发 VIX ≥ 30 时加仓 QQQM
-- **回测结果**: 存入 Object Store `wheel_trade_log.csv`
+### ⚠️ QC Notebook 不能保存 emoji
+QC Cloud 的 `research.ipynb` API 拒绝写入含 `🚀` `⚠️` `✓` 等 Unicode 字符的文件。
+**对策**：抓取脚本（`research_*_leaps.py`）保持**纯 ASCII**。Dashboard（本地 Streamlit）不受此限。
+
+### ⚠️ QC Free Object Store 上限 50 MB
+`qb.ObjectStore.Save()` 累计超过 50MB 会抛 `StorageLimitExceededException`。
+**对策**：
+- 脚本里 Save 已包裹 `try/except` 软失败
+- 同时写盘到 `Output/` 目录（Cell 5 下载按钮基于此）
+- 定期清理 ObjectStore：`for k in qb.ObjectStore.Keys: print(k)` → `qb.ObjectStore.Delete(k)`
+
+### ⚠️ VOO 周度期权 2024 年才上线
+2022-2023 VOO CC 只能月度操作，2024 起才有周度期权。
+
+### ⚠️ LEAPS Δ > 0.95 被过滤
+QQQ LEAPS 数据 Delta 区间 0.50-0.95。当持有的 LEAPS 因标的暴涨 Δ → 0.99，被排除出数据。
+**对策**：intrinsic fallback 已自动覆盖（深 ITM 误差 <2%），不影响策略复盘。
+
+### ⚠️ LEAPS 早期年份选择稀疏
+2018-2019 QQQ LEAPS 主要只有 1 月年度系列，每个快照可能只有 1-2 个到期日。从 2020 起到期日多样性大幅上升。
+**含义**：完整 Roll 实验建议从 2020 起做复盘。
+
+### ⚠️ Ghost Quotes（QC 数据通病）
+全部行 bid=ask（QC 返回理论价，非真实盘口）。远 OTM 无成交合约可能多个行权价 mid 相同。
+**对策**：`filter_liquid(LIQUIDITY_MIN=5)` 过滤 + Δ<0.10 橙色软警告 + 主链表灰显。
+
+### ⚠️ 分红盲区
+Dashboard 不追踪股息。B&H 对比时手动加回：VOO 4 年累计 ~6% / QQQM 年化 ~0.6% / TQQQ 几乎 0%
+详见 `memory/feedback_dividends.md`
 
 ---
 
-## 八、2022 TQQQ 数据陷阱（Gemini 2.5 Pro 分析，2026-04-29）
+## 六、`research_qqq_leaps.py` v2 关键配置
 
-### ⚠️ 陷阱一：TQQQ 2:1 拆股（2022-01-13）
-- ATM Call Strike：2022-01-13 = $141 → 2022-01-14 = $72.5（隔夜减半）
-- **影响**：跨越该日期的持仓 Strike 必须 ÷2，qty ×2，正股成本 ÷2
-- **待实现**：`options_dashboard.py` 预处理函数
+```python
+TICKER     = "QQQ"
+start_time = datetime(2018, 1, 1)
+end_time   = datetime(2025, 12, 31)
+STORE_KEY  = "QQQ_LEAPS_20180101_20251231_greeks.csv"
 
-### ⚠️ 陷阱二：Theta 为年化值（需 ÷365）
-- 示例：Strike=$163 Call，mid=$8.375，theta=-84.35 → 实际日衰减 = -84.35/365 = **-$0.23/天**
-- **影响**：直接使用 theta 列会高估衰减 365 倍
-- **处理**：显示时 `daily_theta = theta / 365`
+option.SetFilter(lambda u: u
+    .IncludeWeeklys()
+    .Strikes(-30, 5)            # 深 ITM 在下方
+    .Expiration(30, 900))       # ★ v2: 下限改 30 覆盖完整生命周期
 
-### ⚠️ 陷阱三：固定滑点在高 IV 时严重低估
-- 2022 年 IV 均值 90%，峰值 120%+（10月暴跌期）
-- `mid × 0.95` 在恐慌期严重低估真实价差
-- **建议**：动态滑点 `fill = mid - mid × 0.02 × (iv / 0.5)`
+# 数据过滤
+if contract.Right != OptionRight.Call: continue   # 仅 Call
+if not (30 <= dte <= 900): continue
+if delta_abs < 0.50 or delta_abs > 0.95: continue # 深 ITM 区
 
-### 📊 2022 数据概况
+SAMPLE_MODE = "weekly"   # weekly / biweekly / daily
+```
+
+**预期输出**：约 32 万行 / 37.5 MB / 8 年覆盖 / 311 周快照
+
+---
+
+## 七、核心分析结果（v5 新增章节）
+
+### 7.1 VOO 4 年 CC 复盘对比（已完成）
+
+**100 股纯净基准**（剥离 59 股 buffer）：
+
+| | 税前 | 税后（全清仓） |
+|---|---|---|
+| Wheel 4 年总收益 | +$20,730 | **+$16,519** |
+| B&H 4 年总收益 | +$19,500 | +$15,539 |
+| **Wheel 优势** | **+$1,230** | **+$980** |
+| 年化超额 | +0.72% | +0.57% |
+
+**关键洞察**：
+- Wheel 净期权收益 +$3,730（权利金 - 买回 - 损失）
+- 资本利得让步 -$2,500（两次低卖高买）
+- **结论：CC 在 VOO 长牛标的上性价比不高，但仍微胜 B&H**
+
+> ⚠️ **方法论修正记录**：早期分析曾错用 `realized_pnl` 和 `premium_collected` 做等式，导致买回成本算成 $3,302（实际 $2,663）。正确方法是**直接累加 closed_positions 的 entry_mid × 100** 作为已开仓权利金，并用**现金流口径**核算（参考 Gemini 方法）。
+
+### 7.2 日本特定口座税收影响（20.315%）
+
+- **加密货币是「雑所得」累进至 55%**（不是 20.315%）— 清仓前看盈亏决定时机
+- **B&H 递延税优势**：不卖就不交税，长期持有复利效应大
+- **Wheel 强制实现资本利得**：每次行权 + 买回 = 强制缴税
+- VOO 4 年 Wheel 累计已缴税 ~$2,383（现金口径已落地）
+
+### 7.3 TQQQ Sell Put 最优 Delta 范围
+
+基于 12 笔实盘 + 反事实模拟：
+
+| 市场状态 | 推荐 Δ | 备注 |
+|---------|--------|------|
+| 牛市稳态 (200MA 上 + RSI<50) | **0.20-0.25** | 用户实测 = 0.235 (5/5 胜) |
+| 反弹追高警惕 | **0.15-0.20** | 用户实测 = 0.183 (7/7 胜) |
+| 防御模式 (200MA 下 / VIX>30) | **0.10-0.15** | HANDOVER 已有防御信号 |
+
+**硬性纪律**：
+- TQQQ 永远不要 Δ > 0.30（3x 杠杆放大尾部）
+- DTE 14 是甜点（θ 衰减效率最佳）
+- 不要无脑每周入场，**信号过滤比 Delta 选择更重要**
+
+### 7.4 实盘建议（2026-05-18 评估示例）
+
+TQQQ $69 Put @ 18 DTE，IV Percentile 92%：
+- 选 $68 Put @ Δ=0.25 限价 $1.88（不要按 Bid $2.03 卖）
+- 必查：QQQ > 200MA / RSI < 50 / 今日阴线 / VIX < 30
+
+---
+
+## 八、TQQQ 2 年模拟结果（v4 完成）
+
 | 指标 | 数值 |
 |------|------|
-| 总行数 | 60,333 |
-| 日期范围 | 2022-01-03 → 2022-12-30 |
-| Strike 范围 | $6 → $265（TQQQ 年初 ~$65 → 年末 ~$17） |
-| IV 均值/中位数 | 90% / 86.6% |
-| bid=ask 比例 | 100%（QC 历史数据限制） |
+| 区间 | 2022-01-14 → 2023-12-15 |
+| 初始资金 | $10,000 |
+| 已实现 PnL | **+$4,389.50** |
+| 2 年回报率 | **+43.9%** |
+| 年化 CAGR | ~19.7% |
+| 期权胜率 | 73.7%（28 OTM / 38 关闭） |
+| 累计权利金 | $3,041（占总盈利 69%） |
+| 被行权次数 | Short Put 5 次 + Short Call 5 次 |
+
+**对比基准**：B&H TQQQ 2022-01→2023-12 ≈ -28%，Wheel 跑赢 70+ 个百分点。
+
+详见 `data/Simulator/workspace_TQQQ_20231215.json`
 
 ---
 
-## 九、下一步建议操作顺序
+## 九、QuantConnect 平台限制（Free 账户）
+
+| 限制 | 说明 | 已应对 |
+|------|------|--------|
+| 无 API 访问 | 不能用 REST API 读写 Object Store | 用 Notebook 内置接口 |
+| 10KB 日志/天 | main.py 回测日志需精简 | — |
+| **Object Store 50MB** | 多次抓取累计会超限 | 软失败 + Output/ 落盘 + 定期清理 |
+| **Notebook API 拒绝 emoji** | `🚀` 等 Unicode 字符无法保存 | 抓取脚本纯 ASCII |
+| 无 UI 下载入口 | Object Store 无浏览器下载 | Cell 5 HTML base64 按钮 |
+
+---
+
+## 十、下一步建议操作顺序
 
 ```
-1. 拆股复权修复（紧急）
-   → options_dashboard.py 加入 2022-01-13 复权预处理
-   → 跨越拆股日的持仓 Strike ÷2，qty ×2，成本 ÷2
+1. 等 LEAPS 8 年数据真正用起来：
+   → 加载 workspace_QQQLeaps_2026-05-21.json
+   → Time Machine 跳到 2020-02 COVID 暴跌前买入 Δ=0.80 LEAPS
+   → 观察 2020-04 -33% 标的下 LEAPS MTM 真实损伤
+   → 关键学习：2022 -33% QQQ 全年 LEAPS 持有人体验
 
-2. main.py CC 防割肉逻辑
-   → if CC_Strike < avg_cost: skip（禁止在深套时贱卖 Call）
+2. VOO 4 年 CC 模拟跑完 → 已完成 (workspace_VOO_2023_2026.json)
+   → 用 7.1 节方法重新做一次纯净 100 股基准对比
+
+3. TQQQ 实盘 1 张 Sell Put 起步（参考 7.4 节）
+
+4. main.py CC 防割肉逻辑 → if CC_Strike < avg_cost: skip
    → 200MA 以下时 Short Put Delta 从 0.25 降至 0.10~0.15
 
-3. 运行 main.py 回测
-   → QuantConnect Algorithm Lab → "Formal Black Alpaca" → Run Backtest
-   → 查看 Logs / Charts / wheel_trade_log.csv
+5. 运行 main.py 回测（QuantConnect Algorithm Lab）
 
-4. 保证金冻结（V4）
+6. 保证金冻结 V5
    → Short Put：cash_available -= strike × 100
-
-5. CCB 工具使用
-   → python ccb.py "你的问题"
-   → 自动加载 HANDOVER.md 背景，Gemini 2.5 Pro 分析后传递给 Claude Code
 ```
+
+---
+
+## 十一、CCB 工具使用
+
+```bash
+python ccb.py "你的问题"
+```
+自动加载本 HANDOVER.md 作为项目背景，用 `gemini-2.5-pro` 分析后将结果传递给 Claude Code。
+
+---
+
+## v5 工程经验提示
+
+1. **现金流口径 > 权益账面**：策略对比时优先用「现金变化」核算，不要用 `realized_pnl` 反推（含未平仓污染）
+2. **QC Notebook 写文件先 ASCII**：emoji 在文档里好看但 QC Save 会拒绝
+3. **Object Store 当临时空间**：不要长期堆积，用完即下载
+4. **LEAPS 数据 DTE 下限给 30**：不要用 365，否则到期前 1 年全断
+5. **Streamlit `st.form` 不重渲染**：动态预览要把 form 拆掉
