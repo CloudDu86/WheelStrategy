@@ -10,6 +10,7 @@ from datetime import date, datetime
 st.set_page_config(page_title="期权复盘工具", layout="wide")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+SIM_DIR = os.path.join(DATA_DIR, "Simulator")
 
 def _scan_data_files() -> dict[str, list[tuple[str, str]]]:
     """扫描 data/ 目录，返回 {ticker: [(label, path), ...]} 按文件名排序。
@@ -33,6 +34,38 @@ def _scan_data_files() -> dict[str, list[tuple[str, str]]]:
 TICKER_DATA = _scan_data_files()  # {ticker: [(label, path), ...]}
 
 CONTRACT_MULT = 100  # 标准期权乘数
+
+# ── 交易成本（MooMoo 证券 日本 · 实盘拟真）默认值 ─────────────────────────────
+# 依据 2026-06-02/03 实际成交报告 + 官网费率表 (moomoo.com/jp/support/topic7_374)
+# ★ round-turn 方式：手续费仅在【新规开仓】一次性收取，【返済平仓】免手续费！
+# 新规成本 = 每单固定费 + 每张变动费（非纯线性）：
+#   每单固定 ≈ システム利用料 1.88 + 消费税 0.18 = $2.07（活动期 ≤7 张/单，按单收）
+#   每张变动 ≈ 決済 0.18 + 清算 0.025 + 规制 0.013 + CAT + 卖出 SEC/TAF ≈ $0.24
+#   佣金 = $0（活动期 ≤7 张）；活动结束后定额 0.30 税込 0.33/张
+# 实测：新规 1 张卖出 = 2.07 + 0.24 = $2.31 ≈ 报告 $2.30 ✓；返済 1 张 = $0 ✓
+# → 1 张完整往返手续费 ≈ $2.30（不是 $4.60！平仓免费）；滑点开平各算
+DEFAULT_SLIPPAGE     = 0.015   # 每股滑点（美元）。买入往上、卖出往下，模拟跨越买卖价差
+DEFAULT_ORDER_FEE    = 2.07    # 每单（每笔开/平）固定费：系统利用料含税
+DEFAULT_PER_CONTRACT = 0.24    # 每张变动费：美国本地结算/清算/规制等
+DEFAULT_COMMISSION   = 0.00    # 每张佣金：活动期免费（活动后改 0.33）
+
+def _txn_costs() -> tuple[float, float, float, float]:
+    """读取滑点 / 每单固定费 / 每张变动费 / 每张佣金（来自侧边栏）。
+    开关关闭时返回 (0, 0, 0, 0)。"""
+    if not st.session_state.get("_txn_enabled", True):
+        return 0.0, 0.0, 0.0, 0.0
+    slip      = st.session_state.get("_txn_slippage", DEFAULT_SLIPPAGE)
+    order_fee = st.session_state.get("_txn_order_fee", DEFAULT_ORDER_FEE)
+    per_ct    = st.session_state.get("_txn_per_contract", DEFAULT_PER_CONTRACT)
+    comm      = st.session_state.get("_txn_commission", DEFAULT_COMMISSION)
+    return float(slip), float(order_fee), float(per_ct), float(comm)
+
+def _fee_for(qty: int) -> tuple[float, float]:
+    """返回 (slippage_per_share, total_fee) ；total_fee = 每单固定 + (每张变动+佣金)×张数。"""
+    slip, order_fee, per_ct, comm = _txn_costs()
+    if order_fee == 0 and per_ct == 0 and comm == 0:
+        return slip, 0.0
+    return slip, order_fee + (per_ct + comm) * qty
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -81,8 +114,11 @@ def get_mid_smart(df: pd.DataFrame, pos: dict, d: date, spot: float | None) -> t
     # 已到期：直接给 0（auto_expire 通常会先处理掉，但兜底）
     if pos["expiry"] <= d:
         return 0.0, True
-    # 仅 Long 期权做 intrinsic 估算（Short 用 intrinsic 会低估盘口成本，不安全）
-    if pos["direction"] == 1 and spot is not None:
+    # Long: intrinsic = 内在价值（安全的下界，深 ITM 误差小）
+    # Short: intrinsic 略低估买回成本（漏算时间价值），仅在确实无报价时兜底，
+    #        用 ⋯ 标记提示用户估算不精确。深 OTM Short (TQQQ 拆股遗留 strike 等)
+    #        intrinsic = 0，让你能至少看到 PnL 和平仓。
+    if spot is not None:
         iv = intrinsic_value(pos["type"], pos["strike"], spot)
         return iv, True
     return None, False
@@ -140,45 +176,95 @@ def record_trade(account: dict, entry: dict) -> None:
 
 
 def open_position(account: dict, pos: dict, entry_date: date, entry_mid: float) -> None:
-    cash_delta = -pos["direction"] * entry_mid * CONTRACT_MULT * pos["qty"]
+    slip, commission = _fee_for(pos["qty"])
+    # 滑点：Long 买入往上成交（付得多），Short 卖出往下成交（收得少）
+    fill = entry_mid + pos["direction"] * slip
+    fill = max(fill, 0.0)
+    pos["entry_mid"] = fill                       # 以真实成交价为入场基准（下游 PnL 一致）
+    pos["entry_commission"] = commission          # 记录开仓费用，平仓时计入 realized
+    cash_delta = -pos["direction"] * fill * CONTRACT_MULT * pos["qty"] - commission
     account["cash"] += cash_delta
-    # Short 开仓：累计记录该标的的权利金收入
+    # Short 开仓：累计记录该标的的权利金收入（按真实成交价）
     if pos["direction"] == -1:
         ticker = pos.get("ticker", "")
         if ticker:
             pc = account.setdefault("premium_collected", {})
-            pc[ticker] = pc.get(ticker, 0.0) + entry_mid * CONTRACT_MULT * pos["qty"]
+            pc[ticker] = pc.get(ticker, 0.0) + fill * CONTRACT_MULT * pos["qty"]
     record_trade(account, {
         "date": entry_date,
         "action": f"开仓 {pos['dir_label']}",
         "symbol": pos["symbol"],
         "qty": pos["qty"],
-        "price": entry_mid,
+        "price": fill,
         "cash_delta": cash_delta,
         "realized": 0.0,
-        "note": f"{pos['type']} ${pos['strike']:.0f} 到期 {pos['expiry']}",
+        "note": f"{pos['type']} ${pos['strike']:.0f} 到期 {pos['expiry']} "
+                f"[新规·滑点${slip:.3f} 手续费${commission:.2f}]",
     })
 
 
 def close_position(account: dict, pos: dict, close_date: date, close_mid: float,
-                   action_label: str) -> None:
-    cash_delta = pos["direction"] * close_mid * CONTRACT_MULT * pos["qty"]
-    realized = pos["direction"] * (close_mid - pos["entry_mid"]) * CONTRACT_MULT * pos["qty"]
+                   action_label: str, charge_costs: bool = True) -> None:
+    """平仓（返済）。MooMoo 实测：返済不收手续费（手续费在新规开仓时一次性收取），
+    但滑点是市场成本仍然适用。charge_costs=False 用于到期结算（连滑点也不收）。"""
+    if charge_costs:
+        # 返済手续费 = 0（已在 entry_commission 一次性计入），仅扣滑点
+        slip, _of, _pc, _cm = _txn_costs()
+        # 滑点：平 Long 是卖出（往下），平 Short 是买回（往上）
+        fill = close_mid - pos["direction"] * slip
+        fill = max(fill, 0.0)
+    else:
+        slip = 0.0
+        fill = close_mid
+    commission = 0.0  # 返済无手续费
+    entry_comm = pos.get("entry_commission", 0.0)
+    cash_delta = pos["direction"] * fill * CONTRACT_MULT * pos["qty"]
+    # realized 计入开仓时一次性收取的手续费（返済不再收），反映全周期净现金影响
+    realized = (pos["direction"] * (fill - pos["entry_mid"]) * CONTRACT_MULT * pos["qty"]
+                - entry_comm)
     account["cash"] += cash_delta
     account["realized_pnl"] += realized
     pos["close_date"] = close_date
-    pos["close_mid"] = close_mid
+    pos["close_mid"] = fill
     pos["realized"] = realized
     record_trade(account, {
         "date": close_date,
         "action": f"{action_label} {pos['dir_label']}",
         "symbol": pos["symbol"],
         "qty": pos["qty"],
-        "price": close_mid,
+        "price": fill,
         "cash_delta": cash_delta,
         "realized": realized,
-        "note": f"{pos['type']} ${pos['strike']:.0f}",
+        "note": f"{pos['type']} ${pos['strike']:.0f}"
+                + (f" [返済·免手续费 滑点${slip:.3f}]" if charge_costs else " [到期结算·免费用]"),
     })
+
+
+def partial_close_position(account: dict, positions: list, idx: int, close_date: date,
+                           close_mid: float, qty_to_close: int, action_label: str) -> dict:
+    """部分平仓：把第 idx 个持仓拆成「已平 qty_to_close 张」+「剩余张数」。
+    开仓手续费(entry_commission)按张数比例分摊。返回已平的那一块（调用方负责
+    append 到 closed_positions）。qty_to_close ≥ 总张数时退化为整仓平。"""
+    pos = positions[idx]
+    total_qty = pos["qty"]
+    qty_to_close = max(1, min(int(qty_to_close), total_qty))
+    full_entry_comm = pos.get("entry_commission", 0.0)
+
+    if qty_to_close == total_qty:
+        close_position(account, pos, close_date, close_mid, action_label)
+        positions.pop(idx)
+        return pos
+
+    # 拆出被平的那块（按比例分摊开仓手续费）
+    chunk = dict(pos)
+    chunk["qty"] = qty_to_close
+    chunk["entry_commission"] = full_entry_comm * qty_to_close / total_qty
+    close_position(account, chunk, close_date, close_mid, f"{action_label}(部分)")
+
+    # 更新剩余仓位
+    pos["qty"] = total_qty - qty_to_close
+    pos["entry_commission"] = full_entry_comm * (total_qty - qty_to_close) / total_qty
+    return chunk
 
 
 def _add_lot(account: dict, ticker: str, qty: int, price: float, lot_date: date) -> None:
@@ -577,7 +663,8 @@ def auto_expire(df: pd.DataFrame, account: dict, open_positions: list,
         else:  # Long
             iv = intrinsic_value(pos["type"], pos["strike"], spot)
             close_position(account, pos, pos["expiry"], iv,
-                           action_label=f"到期结算 ({'ITM' if is_itm else 'OTM'})")
+                           action_label=f"到期结算 ({'ITM' if is_itm else 'OTM'})",
+                           charge_costs=False)
         closed_positions.append(pos)
     return still_open
 
@@ -747,6 +834,55 @@ with st.sidebar:
         st.session_state.closed_positions = []
         st.rerun()
 
+    # ── 交易成本（MooMoo 日本 · 实盘拟真）──────────────────────────────────────
+    with st.expander("💱 交易成本（MooMoo 实盘拟真）", expanded=False):
+        st.caption(
+            "依实际成交报告校准。★手续费仅在【新规开仓】一次性收取，【返済平仓】免手续费。\n"
+            "下方费用 = 每单固定 + 每张变动，仅用于新规。滑点开/平均扣（市场成本）。"
+        )
+        st.checkbox(
+            "启用交易成本",
+            value=st.session_state.get("_txn_enabled", True),
+            key="_txn_enabled",
+            help="关闭则按裸 mid 价成交（理论值）",
+        )
+        if st.session_state.get("_txn_enabled", True):
+            st.number_input(
+                "滑点 / 每股 ($)",
+                min_value=0.0, max_value=0.50, step=0.005, format="%.3f",
+                value=st.session_state.get("_txn_slippage", DEFAULT_SLIPPAGE),
+                key="_txn_slippage",
+                help="买入往上、卖出往下各偏移此值（≈跨越买卖价差）。报告无法反推，需自行估，建议 0.01~0.02。",
+            )
+            st.number_input(
+                "每单固定费 ($/单)",
+                min_value=0.0, max_value=20.0, step=0.1, format="%.2f",
+                value=st.session_state.get("_txn_order_fee", DEFAULT_ORDER_FEE),
+                key="_txn_order_fee",
+                help="システム利用料(含税)。活动期 ≤7 张/单 = $2.07，按单收（不按张）。",
+            )
+            st.number_input(
+                "每张变动费 ($/张)",
+                min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
+                value=st.session_state.get("_txn_per_contract", DEFAULT_PER_CONTRACT),
+                key="_txn_per_contract",
+                help="决済0.18+清算0.025+规制0.013+CAT+卖出SEC/TAF ≈ $0.24/张（美国本地费）。",
+            )
+            st.number_input(
+                "佣金 ($/张)",
+                min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
+                value=st.session_state.get("_txn_commission", DEFAULT_COMMISSION),
+                key="_txn_commission",
+                help="取引手数料。活动期 ≤7 张免费 = $0；活动后定额 $0.33(税込)/张。",
+            )
+        slip_now, order_now, perct_now, comm_now = _txn_costs()
+        fee_1 = (order_now + (perct_now + comm_now) * 1) if (order_now or perct_now or comm_now) else 0.0
+        st.caption(
+            f"新规 1 张手续费 ≈ ${fee_1:.2f}（实测 $2.30）· 返済免手续费 · "
+            f"滑点 ${slip_now:.3f}/股（开平各扣）· "
+            f"1 张往返手续费 ≈ ${fee_1:.2f}"
+        )
+
     st.divider()
     st.subheader("工作区保存 / 加载")
 
@@ -758,15 +894,69 @@ with st.sidebar:
         st.session_state.current_date_idx if st.session_state.current_date_idx is not None else 0,
         st.session_state.active_ticker,
     )
-    fname = f"workspace_{st.session_state.active_ticker}_{date.today().isoformat()}.json"
+    default_fname = f"workspace_{st.session_state.active_ticker}_{date.today().isoformat()}.json"
+
+    # ── 浏览器下载（原有方式，下载到浏览器默认目录）──────────────────────────
     st.download_button(
-        "💾 保存进度",
+        "💾 下载进度（浏览器）",
         data=ws_json,
-        file_name=fname,
+        file_name=default_fname,
         mime="application/json",
         use_container_width=True,
-        help="将当前账户、持仓、历史记录全部保存为 JSON 文件",
+        help="将当前账户、持仓、历史记录下载为 JSON 文件（存到浏览器下载目录）",
     )
+
+    # ── 直接写盘到 data/Simulator/ ────────────────────────────────────────────
+    src_name = st.session_state.get("_loaded_ws_name")
+    src_path = os.path.join(SIM_DIR, src_name) if src_name else None
+    src_exists = bool(src_path) and os.path.exists(src_path)
+
+    save_mode = st.radio(
+        "写盘方式",
+        options=["保存为新文件", "覆盖源文件"],
+        horizontal=True,
+        help="直接写入 data/Simulator/ 目录。覆盖源文件仅在加载过本地工作区后可用。",
+    )
+
+    if save_mode == "保存为新文件":
+        new_name = st.text_input(
+            "文件名",
+            value=default_fname,
+            help="保存到 data/Simulator/ 目录",
+        )
+        if st.button("📁 保存到 data/Simulator/", use_container_width=True):
+            if not new_name.strip():
+                st.error("请输入文件名")
+            else:
+                fn = new_name.strip()
+                if not fn.endswith(".json"):
+                    fn += ".json"
+                dest = os.path.join(SIM_DIR, fn)
+                try:
+                    os.makedirs(SIM_DIR, exist_ok=True)
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write(ws_json)
+                    st.session_state._loaded_ws_name = fn  # 之后可直接覆盖此文件
+                    st.success(f"已保存：data/Simulator/{fn}")
+                except Exception as e:
+                    st.error(f"保存失败：{e}")
+    else:  # 覆盖源文件
+        if not src_exists:
+            st.caption(
+                "⚠️ 无可覆盖的源文件。请先用「📂 加载进度」上传一个位于 "
+                "`data/Simulator/` 的工作区，或改用「保存为新文件」。"
+            )
+            st.button("♻️ 覆盖源文件", use_container_width=True, disabled=True,
+                      key="overwrite_na")
+        else:
+            st.caption(f"将覆盖：`data/Simulator/{src_name}`")
+            if st.button("♻️ 覆盖源文件", use_container_width=True, type="primary"):
+                try:
+                    with open(src_path, "w", encoding="utf-8") as f:
+                        f.write(ws_json)
+                    st.success(f"已覆盖：data/Simulator/{src_name}")
+                except Exception as e:
+                    st.error(f"覆盖失败：{e}")
 
     # ── 加载 ──────────────────────────────────────────────────────────────────
     uploaded_ws = st.file_uploader(
@@ -789,6 +979,7 @@ with st.sidebar:
                 # current_date_idx 需要在数据加载后校验范围，先暂存
                 st.session_state._pending_date_idx = payload.get("current_date_idx", 0)
                 st.session_state._loaded_ws_id     = file_id   # 标记已加载，下次 rerun 不重复
+                st.session_state._loaded_ws_name   = uploaded_ws.name  # 记录源文件名（用于覆盖保存）
                 st.success(f"工作区已加载：{len(payload['positions'])} 个持仓，{len(payload['account']['history'])} 条流水")
                 st.rerun()
             except Exception as e:
@@ -895,11 +1086,20 @@ with st.sidebar:
     else:
         expiries_to_show = available_expiries
 
+    # 跨日期保留上次选中的到期日（若仍在新列表里）
+    prev_expiry = st.session_state.get("_selected_expiry")
+    if prev_expiry in expiries_to_show:
+        default_idx = expiries_to_show.index(prev_expiry)
+    else:
+        default_idx = 0
     selected_expiry = st.selectbox(
         "到期日" + ("（仅 LEAPS）" if leaps_mode else ""),
         expiries_to_show,
+        index=default_idx,
         format_func=lambda d: f"{d}  (DTE {(d - selected_date).days})",
+        key="_expiry_selectbox",
     )
+    st.session_state["_selected_expiry"] = selected_expiry
 
     # 跳到到期日：让复盘日 = 选中的到期日（若该日无快照，取最近的 ≤ 到期日的快照）
     from datetime import timedelta as _td
@@ -997,27 +1197,37 @@ with top_cols[3]:
     dte = (selected_expiry - selected_date).days
     st.metric("距到期 (DTE)", f"{dte} 天")
 
+# 自动判断数据采样节奏（日采样 vs 周采样）
+if len(all_dates) >= 2:
+    gap_days = (all_dates[1] - all_dates[0]).days
+else:
+    gap_days = 1
+is_weekly = gap_days >= 5
+step_label = "1周" if is_weekly else "1日"
+big_step_label = "5周" if is_weekly else "1周"
+big_step = 5  # 5 个快照（日采样=1周，周采样=5周）
+
 with top_cols[4]:
     st.write("")
     st.write("")
-    if st.button("⏪ -1日", use_container_width=True,
+    if st.button(f"⏪ -{step_label}", use_container_width=True,
                  disabled=st.session_state.current_date_idx == 0):
         st.session_state.current_date_idx -= 1
         st.rerun()
 with top_cols[5]:
     st.write("")
     st.write("")
-    if st.button("⏭ +1日", use_container_width=True,
+    if st.button(f"⏭ +{step_label}", use_container_width=True,
                  disabled=st.session_state.current_date_idx >= len(all_dates) - 1):
         st.session_state.current_date_idx += 1
         st.rerun()
 with top_cols[6]:
     st.write("")
     st.write("")
-    if st.button("⏩ +1周", use_container_width=True,
+    if st.button(f"⏩ +{big_step_label}", use_container_width=True,
                  disabled=st.session_state.current_date_idx >= len(all_dates) - 1):
         st.session_state.current_date_idx = min(
-            len(all_dates) - 1, st.session_state.current_date_idx + 5
+            len(all_dates) - 1, st.session_state.current_date_idx + big_step
         )
         st.rerun()
 
@@ -1261,26 +1471,42 @@ else:
 
     st.divider()
     st.subheader("平仓操作")
-    close_cols = st.columns(min(len(st.session_state.positions), 4))
-    to_remove = None
+    st.caption("张数可调，支持部分平仓；剩余张数继续持有。")
+    close_request = None  # (idx, qty_to_close)
     for i, pos in enumerate(st.session_state.positions):
-        col = close_cols[i % len(close_cols)]
-        label = f"平仓 #{i}  ${pos['strike']:.0f} {pos['type']} ({pos['dir_label']})"
-        if col.button(label, key=f"close_{i}"):
-            to_remove = i
+        c_info, c_qty, c_btn = st.columns([3, 1, 1.4])
+        c_info.markdown(
+            f"**#{i}　${pos['strike']:.0f} {pos['type']}** ({pos['dir_label']})　"
+            f"· 持有 {pos['qty']} 张 · 到期 {pos['expiry']}"
+        )
+        if pos["qty"] > 1:
+            qty_to_close = c_qty.number_input(
+                "平仓张数", min_value=1, max_value=int(pos["qty"]),
+                value=int(pos["qty"]), step=1, key=f"close_qty_{i}",
+                label_visibility="collapsed",
+            )
+        else:
+            qty_to_close = 1
+            c_qty.markdown("1 张")
+        btn_label = (f"平仓 {qty_to_close}/{pos['qty']} 张"
+                     if pos["qty"] > 1 else "平仓")
+        if c_btn.button(btn_label, key=f"close_{i}", use_container_width=True):
+            close_request = (i, int(qty_to_close))
 
-    if to_remove is not None:
-        pos = st.session_state.positions[to_remove]
+    if close_request is not None:
+        idx, qty_to_close = close_request
+        pos = st.session_state.positions[idx]
         cur_mid, is_est = get_mid_smart(df, pos, selected_date, est_price)
         if cur_mid is None:
-            st.warning(f"持仓 #{to_remove} 在 {selected_date} 无报价、且不能用 intrinsic 估算，无法平仓")
+            st.warning(f"持仓 #{idx} 在 {selected_date} 无报价、且不能用 intrinsic 估算，无法平仓")
         else:
             if is_est:
-                st.info(f"⋯ 持仓 #{to_remove} 当天无盘口报价，按 intrinsic value ${cur_mid:.2f} 平仓（深 ITM Long 估算）")
-            close_position(st.session_state.account, pos, selected_date, cur_mid,
-                           action_label="手动平仓")
-            st.session_state.closed_positions.append(pos)
-            st.session_state.positions.pop(to_remove)
+                st.info(f"⋯ 持仓 #{idx} 当天无盘口报价，按 intrinsic value ${cur_mid:.2f} 平仓（深 ITM Long 估算）")
+            chunk = partial_close_position(
+                st.session_state.account, st.session_state.positions,
+                idx, selected_date, cur_mid, qty_to_close, action_label="手动平仓",
+            )
+            st.session_state.closed_positions.append(chunk)
             st.rerun()
 
     # ── Roll Up & Out ──────────────────────────────────────────────────────────
