@@ -1,9 +1,9 @@
 # Project Handover — 指数+期权双轨交易轮动系统
 
-**最后更新**: 2026-05-21 (**v5** — LEAPS 模块上线 + Time Machine + 批次成本 + intrinsic fallback)
+**最后更新**: 2026-11-07 (**v6** — MooMoo 交易成本模型 + 部分平仓 + 存盘 + GLD/QQQ/TQQQ 短期数据按年抓取)
 **平台**: QuantConnect Cloud (Free 账户) + 本地 Streamlit Dashboard
 **用户**: Du Guanyun (cloudmori86@gmail.com)
-**工作目录**: `D:\Claude_Code\QuantConnect\`
+**工作目录**: `D:\Coding_Projects\QuantConnect\`（旧路径 `D:\Claude_Code\QuantConnect\` 已弃用；抓取脚本注释里仍写旧路径）
 **GitHub**: https://github.com/CloudDu86/WheelStrategy
 
 ---
@@ -39,7 +39,40 @@
 
 ## 二、当前进度
 
-### ✅ v5 完成项（本轮新增 ★）
+### ✅ v6 完成项（commit `230c20c`，2026-06-16）
+
+**Dashboard（options_dashboard.py，~1950 行）**
+
+1. **MooMoo Japan 交易成本模型**（按 2026-06-02/03 实盘成交确认书校准）
+   - 手续费**只在新规（开仓）收取**：每单固定 `$2.07` + 每张 `$0.24`（1 张 ≈ $2.31，实测报告 $2.30 ✓）
+   - **返済（平仓）免费** → 1 张完整往返 ≈ $2.30，不是 $4.60
+   - 佣金：活动期（≤7 张）$0；活动结束后 0.33/张（税込）→ 侧边栏手动改
+   - 滑点默认 `$0.015/股`，开、平两腿都计入成交价（买入往上、卖出往下）
+   - 到期作废 / 被行权结算**不收费**
+   - 侧边栏「💱 交易成本」面板，可整体开关；相关函数 `_txn_costs()` / `_fee_for(qty)`
+   - 开仓手续费在开仓时一次记账，并带入该仓位的 realized PnL
+2. **部分平仓** `partial_close_position()`：每个仓位可输入平仓张数，拆成「已平部分」+「剩余仓位」，开仓手续费按张数比例分摊
+3. **存盘到本地**：「保存为新文件 / 覆盖源文件」直接写入 `data/Simulator/`（覆盖只在加载过本地 workspace 后可用）
+4. **到期日下拉框跨日期步进保持选中**（key + session 镜像）
+5. **+1日/+1周 按钮自动改名**：LEAPS 这类周度采样数据时按钮语义随之调整
+6. **Short 仓位也启用 intrinsic fallback**：报价缺失（如拆股导致行权价断档）时按内在价值估算（v5 只对 Long 生效）
+
+**数据抓取脚本（按年分文件，规避 50MB Object Store 上限 + 免费账户长时间运行被终止）**
+
+7. `research_gld_options.py` — GLD DTE 0-60，Δ 0.02-0.60，每日采样，2022-2025 单文件（用于 GLD 卖 Call 收租 / 0DTE 测试）
+8. `research_qqq_shortcall.py` — QQQ DTE 1-60，Δ 0.05-0.70，每日 15:45 ET 快照，2021-2025 每年一个 CSV（改 `YEAR` 逐年跑）
+9. `TQQQ_trades_summary.txt` — TQQQ 38 笔交易按时间顺序导出 + 分类统计（胜率 37/38）
+
+### 🆕 v6 之后（未提交）
+
+10. `research_tqqq_calls.py` — **研究「买 TQQQ Call vs 买 QQQ Call」**。TQQQ DTE 1-60，Δ 0.05-0.95，每日采样，2021-2025 每年一个 CSV。
+    - 修正旧 TQQQ 数据的盲区：旧数据 Δ ≤ 0.60 / DTE ≥ 7，赚钱的 Call 进 ITM 后、以及临近到期的平仓都会掉出数据集
+    - 注意 2022-01-13 TQQQ 2:1 拆股：Raw 模式下 2021 年的行权价约为拆股后的 2 倍
+    - 5 个年度 CSV 已在 `data/`；旧的 2022/2023 TQQQ 数据已移入 `data/Old data/`
+11. `workspace_QQQ_Call_option_2026-06-14.json` — QQQ 短期买 Call 复盘存档
+12. `workspace_GLD_2026-06-03.json` / `workspace_QQQLeaps_2026-06-03.json` — GLD 卖 Call、QQQ LEAPS 复盘进度
+
+### ✅ v5 完成项
 
 **Dashboard 功能（options_dashboard.py，~1700 行）**
 
@@ -74,9 +107,11 @@
 **新数据集**
 19. ★ **QQQ_LEAPS_20180101_20251231_greeks.csv** — 37.45 MB / 326,624 行 / 8 年覆盖
 
-### 🔲 v5 后续待办
+### 🔲 后续待办（v5 遗留 + v6 新增）
 
-1. **VOO 4 年 CC 模拟跑完** — 月度循环约 48 次，对比 B&H（含分红补偿 +6%）
+0. ★ **TQQQ Call vs QQQ Call 对比复盘** — 数据已齐（两边 2021-2025 年度 CSV），在 Dashboard 里用同一信号日对比；记得把 `research_tqqq_calls.py` 提交进 git
+0b. ★ **清理重名文件** `data/TQQQ_options_20230101_20231231_greeks (1).csv` → 去掉 ` (1)`，否则 Dashboard 文件扫描器可能识别异常
+1. ~~**VOO 4 年 CC 模拟跑完**~~ → 已完成（`workspace_VOO_2023_2026.json`）
 2. **TQQQ 拆股复权** — 2022-01-13 TQQQ 2:1 拆股，跨日持仓 Strike ÷2、qty ×2
 3. **main.py CC 防割肉逻辑** — `if CC_Strike < avg_cost: skip`
 4. **QuantConnect main.py 回测**（2021-2024）
@@ -93,7 +128,11 @@
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| `options_dashboard.py` | 75 KB | **Streamlit 复盘工具 v5**（~1700 行） |
+| `options_dashboard.py` | ~85 KB | **Streamlit 复盘工具 v6**（~1950 行） |
+| `research_tqqq_calls.py` | 8 KB | **★ v6 后** TQQQ DTE 1-60 / Δ 0.05-0.95，按年（未提交） |
+| `research_qqq_shortcall.py` | 8 KB | **★ v6** QQQ DTE 1-60 / Δ 0.05-0.70，按年 |
+| `research_gld_options.py` | 8 KB | **★ v6** GLD DTE 0-60 / Δ 0.02-0.60，2022-2025 |
+| `TQQQ_trades_summary.txt` | 6 KB | **★ v6** TQQQ 38 笔交易汇总 |
 | `research_qqq_options.py` | 8 KB | 短期期权抓取脚本（VOO 模板，DTE 1-60） |
 | `research_qqq_leaps.py` | 11 KB | **★ QQQ LEAPS 抓取脚本 v2**（DTE 30-900，纯 ASCII） |
 | `research_voo_leaps.py` | 11 KB | VOO LEAPS 抓取脚本（备用，未跑） |
@@ -109,8 +148,12 @@
 |------|------|------|------|
 | **QQQ_LEAPS_20180101_20251231_greeks.csv** | **37.45 MB** | **326,624** | **★ QQQ LEAPS 8 年 (DTE 30-900, Δ 0.50-0.95, Call only)** |
 | VOO_options_20220101_20251231_greeks.csv | 14.28 MB | 133,562 | VOO 4 年（2022-2025），DTE 7-60 |
-| TQQQ_options_20220201_20221231_greeks.csv | 6.61 MB | 60,333 | TQQQ 2022 全年 |
-| TQQQ_options_20230101_20231231_greeks.csv | 4.89 MB | 44,658 | TQQQ 2023 全年 |
+| **GLD_options_20220101_20251231_greeks.csv** | 49 MB | — | ★ v6 GLD 4 年，DTE 0-60，每日 |
+| **QQQ_options_\<YEAR\>0101_\<YEAR\>1231_greeks.csv** ×5 | 24-36 MB/年 | — | ★ v6 QQQ 2021-2025，DTE 1-60，Δ 0.05-0.70，每日 |
+| **TQQQ_options_\<YEAR\>0101_\<YEAR\>1231_greeks.csv** ×5 | 10-20 MB/年 | — | ★ v6 后 TQQQ 2021-2025，DTE 1-60，Δ 0.05-0.95，每日（2023 文件名带 ` (1)` 待改） |
+| `Old data/` | — | — | 旧 TQQQ 2022/2023 数据（DTE 7-45，Δ 0.05-0.60），已被新数据替代 |
+
+> 数据 CSV 不进 git，只在本地 `data/` 下。
 
 ### Workspace JSON (data/Simulator/)
 
@@ -121,7 +164,10 @@
 | `workspace_VOO_2023_2026.json` | VOO 完整 4 年复盘存档（38 笔 closed, +$14,385，胜率 86.8%） |
 | `workspace_TQQQ_20231215.json` | TQQQ 2 年完整 Wheel 存档（+43.9%） |
 | `workspace_TQQQ_2026-05-02.json` | TQQQ 2026 测试 |
-| `workspace_QQQLeaps_2026-05-21.json` | **★ 新增** QQQ LEAPS 复盘起始 |
+| `workspace_QQQLeaps_2026-06-03.json` | QQQ LEAPS 复盘进度（取代 05-21 起始版） |
+| `workspace_GLD_2026-06-03.json` | **★ v6** GLD 卖 Call 复盘 |
+| `workspace_QQQ_Call_option_2026-06-14.json` | **★ v6** QQQ 短期买 Call 复盘 |
+| `workspace_TQQQ_20230721.json` | TQQQ 中间快照（18 笔，是 20231215 版的子集） |
 
 ---
 
@@ -200,13 +246,16 @@ shares[ticker] = {
 - `_sell_lots_fifo()`：Short Call 备兑结算时 FIFO 消耗，返回真实成本（不是平均成本）
 - 向后兼容：旧 workspace JSON 无 `lots` 字段时自动合成单一批次
 
-### 4.6 PnL / 现金流公式（不变）
+### 4.6 PnL / 现金流公式（v6：含交易成本）
 
 ```
-pnl       = direction × (cur_mid - entry_mid) × 100 × qty
-开仓现金流 = -direction × mid × 100 × qty   (Short 收入 / Long 支出)
-平仓现金流 = +direction × mid × 100 × qty   (Short 买回支出 / Long 卖出收入)
+fill      = mid ± slippage            (买入 +slip，卖出 -slip；开、平两腿都算)
+pnl       = direction × (cur_fill - entry_fill) × 100 × qty - entry_fee
+开仓现金流 = -direction × fill × 100 × qty - (order_fee + (per_contract + commission) × qty)
+平仓现金流 = +direction × fill × 100 × qty   (返済免费，只有滑点)
+到期/行权 = 不收费
 ```
+「💱 交易成本」开关关闭时，滑点和手续费都为 0，公式退回 v5 版本。
 
 ---
 
@@ -353,8 +402,12 @@ TQQQ $69 Put @ 18 DTE，IV Percentile 92%：
 ## 十、下一步建议操作顺序
 
 ```
+0. ★ v6 新：TQQQ Call vs QQQ Call 对比
+   → 先改名 TQQQ 2023 文件、提交 research_tqqq_calls.py
+   → 同一买入信号日分别在 TQQQ / QQQ 年度数据上开 Call，比较收益、回撤、手续费占比
+
 1. 等 LEAPS 8 年数据真正用起来：
-   → 加载 workspace_QQQLeaps_2026-05-21.json
+   → 加载 workspace_QQQLeaps_2026-06-03.json
    → Time Machine 跳到 2020-02 COVID 暴跌前买入 Δ=0.80 LEAPS
    → 观察 2020-04 -33% 标的下 LEAPS MTM 真实损伤
    → 关键学习：2022 -33% QQQ 全年 LEAPS 持有人体验
@@ -391,3 +444,10 @@ python ccb.py "你的问题"
 3. **Object Store 当临时空间**：不要长期堆积，用完即下载
 4. **LEAPS 数据 DTE 下限给 30**：不要用 365，否则到期前 1 年全断
 5. **Streamlit `st.form` 不重渲染**：动态预览要把 form 拆掉
+
+## v6 工程经验提示
+
+1. **QC 抓取按年分文件**：多年数据一次跑会撞 50MB Object Store 上限，还会被免费账户的会话超时终止 → 设置 `YEAR`，每年 Run All → 下载 → 重启 Notebook
+2. **成本模型用实盘成交确认书校准**：MooMoo 平仓免费，往返成本不是开仓费 × 2
+3. **数据过滤范围要覆盖「赢家」**：买 Call 研究里 Δ 上限给到 0.95、DTE 下限给到 1，否则进 ITM 的赚钱仓位和临近到期的平仓都会从数据里消失
+4. **Streamlit selectbox 跨步进保持选中**：用固定 `key` + session_state 镜像，否则日期一变选项列表重建就会跳回第一项
