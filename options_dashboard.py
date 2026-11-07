@@ -7,6 +7,8 @@ import os
 import re
 from datetime import date, datetime
 
+import trade_chart
+
 st.set_page_config(page_title="期权复盘工具", layout="wide")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -742,7 +744,15 @@ if "active_data_files" not in st.session_state:
     st.session_state.active_data_files = []
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
+PAGE_SIM, PAGE_REPLAY = "🎮 模拟实盘", "📊 复盘交易图"
+
 with st.sidebar:
+    page = st.segmented_control(
+        "页面", [PAGE_SIM, PAGE_REPLAY], default=PAGE_SIM, key="_page",
+        label_visibility="collapsed",
+    ) or PAGE_SIM   # 再次点击已选中的选项会变成 None → 回到默认页
+    is_replay = page == PAGE_REPLAY
+
     st.header("过滤控制")
 
     selected_ticker = st.radio(
@@ -1065,72 +1075,78 @@ with st.sidebar:
     st.session_state.current_date_idx = all_dates.index(selected_date)
 
     day_df = df[df["snapshot_date"] == selected_date]
-    available_expiries = sorted(day_df["expiry"].unique())
 
-    # ── 🚀 LEAPS 模式（联动过滤到期日和期权类型）──
-    leaps_mode = st.checkbox(
-        "🚀 LEAPS 模式（一键过滤长期深实值 Call）",
-        value=st.session_state.get("_leaps_mode", False),
-        key="_leaps_mode",
-        help="开启后：仅显示 Call、DTE>365 的到期日、Delta 0.6-0.9 的合约。\n"
-             "便于挑选 LEAPS 长期持仓（典型 Delta≈0.80，DTE 接近 730）",
-    )
+    if not is_replay:
+        available_expiries = sorted(day_df["expiry"].unique())
 
-    leaps_expiries = [d for d in available_expiries if (d - selected_date).days > 365]
-    if leaps_mode:
-        if not leaps_expiries:
-            st.warning("⚠️ 当前数据中无 DTE>365 的到期日，无 LEAPS 可选。请关闭 LEAPS 模式或换日期。")
-            expiries_to_show = available_expiries  # 兜底
+        # ── 🚀 LEAPS 模式（联动过滤到期日和期权类型）──
+        leaps_mode = st.checkbox(
+            "🚀 LEAPS 模式（一键过滤长期深实值 Call）",
+            value=st.session_state.get("_leaps_mode_saved", False),
+            key="_leaps_mode_cb",
+            help="开启后：仅显示 Call、DTE>365 的到期日、Delta 0.6-0.9 的合约。\n"
+                 "便于挑选 LEAPS 长期持仓（典型 Delta≈0.80，DTE 接近 730）",
+        )
+
+        st.session_state["_leaps_mode_saved"] = leaps_mode
+
+        leaps_expiries = [d for d in available_expiries if (d - selected_date).days > 365]
+        if leaps_mode:
+            if not leaps_expiries:
+                st.warning("⚠️ 当前数据中无 DTE>365 的到期日，无 LEAPS 可选。请关闭 LEAPS 模式或换日期。")
+                expiries_to_show = available_expiries  # 兜底
+            else:
+                expiries_to_show = leaps_expiries
         else:
-            expiries_to_show = leaps_expiries
-    else:
-        expiries_to_show = available_expiries
+            expiries_to_show = available_expiries
 
-    # 跨日期保留上次选中的到期日（若仍在新列表里）
-    prev_expiry = st.session_state.get("_selected_expiry")
-    if prev_expiry in expiries_to_show:
-        default_idx = expiries_to_show.index(prev_expiry)
-    else:
-        default_idx = 0
-    selected_expiry = st.selectbox(
-        "到期日" + ("（仅 LEAPS）" if leaps_mode else ""),
-        expiries_to_show,
-        index=default_idx,
-        format_func=lambda d: f"{d}  (DTE {(d - selected_date).days})",
-        key="_expiry_selectbox",
-    )
-    st.session_state["_selected_expiry"] = selected_expiry
+        # 跨日期保留上次选中的到期日（若仍在新列表里）
+        prev_expiry = st.session_state.get("_selected_expiry")
+        if prev_expiry in expiries_to_show:
+            default_idx = expiries_to_show.index(prev_expiry)
+        else:
+            default_idx = 0
+        selected_expiry = st.selectbox(
+            "到期日" + ("（仅 LEAPS）" if leaps_mode else ""),
+            expiries_to_show,
+            index=default_idx,
+            format_func=lambda d: f"{d}  (DTE {(d - selected_date).days})",
+            key="_expiry_selectbox",
+        )
+        st.session_state["_selected_expiry"] = selected_expiry
 
-    # 跳到到期日：让复盘日 = 选中的到期日（若该日无快照，取最近的 ≤ 到期日的快照）
-    from datetime import timedelta as _td
-    exp_candidates = [d for d in all_dates if d <= selected_expiry]
-    if exp_candidates:
-        exp_jump = exp_candidates[-1]
-        label = "📅 跳到到期日" if exp_jump == selected_expiry else f"📅 跳到到期日 (最近: {exp_jump})"
-        if st.button(label, use_container_width=True,
-                     help=f"将复盘日设为 {exp_jump}"):
-            st.session_state.current_date_idx = all_dates.index(exp_jump)
-            st.rerun()
-    else:
-        st.caption(f"⚠️ {selected_expiry} 及之前无可用快照")
+        # 跳到到期日：让复盘日 = 选中的到期日（若该日无快照，取最近的 ≤ 到期日的快照）
+        from datetime import timedelta as _td
+        exp_candidates = [d for d in all_dates if d <= selected_expiry]
+        if exp_candidates:
+            exp_jump = exp_candidates[-1]
+            label = "📅 跳到到期日" if exp_jump == selected_expiry else f"📅 跳到到期日 (最近: {exp_jump})"
+            if st.button(label, use_container_width=True,
+                         help=f"将复盘日设为 {exp_jump}"):
+                st.session_state.current_date_idx = all_dates.index(exp_jump)
+                st.rerun()
+        else:
+            st.caption(f"⚠️ {selected_expiry} 及之前无可用快照")
 
-    # 跳到到期日的 1 周之前：用于 Roll Up & Out 收租时机检视
-    target_date = selected_expiry - _td(days=7)
-    candidates = [d for d in all_dates if d <= target_date]
-    if candidates:
-        jump_date = candidates[-1]
-        if st.button("⏪ 跳到期日的 1 周之前", use_container_width=True,
-                     help=f"将复盘日设为 {jump_date}（{selected_expiry} 前 7 天最近快照）"):
-            st.session_state.current_date_idx = all_dates.index(jump_date)
-            st.rerun()
-    else:
-        st.caption(f"⚠️ {selected_expiry} 前 7 天无可用快照")
+        # 跳到到期日的 1 周之前：用于 Roll Up & Out 收租时机检视
+        target_date = selected_expiry - _td(days=7)
+        candidates = [d for d in all_dates if d <= target_date]
+        if candidates:
+            jump_date = candidates[-1]
+            if st.button("⏪ 跳到期日的 1 周之前", use_container_width=True,
+                         help=f"将复盘日设为 {jump_date}（{selected_expiry} 前 7 天最近快照）"):
+                st.session_state.current_date_idx = all_dates.index(jump_date)
+                st.rerun()
+        else:
+            st.caption(f"⚠️ {selected_expiry} 前 7 天无可用快照")
 
-    if leaps_mode:
-        option_type = "Call"
-        st.caption("⚙️ LEAPS 模式：固定 Call，过滤 Delta 0.60-0.90")
-    else:
-        option_type = st.radio("期权类型", ["Call", "Put"])
+        if leaps_mode:
+            option_type = "Call"
+            st.caption("⚙️ LEAPS 模式：固定 Call，过滤 Delta 0.60-0.90")
+        else:
+            option_type = st.radio("期权类型", ["Call", "Put"],
+                                   index=["Call", "Put"].index(st.session_state.get("_option_type_saved", "Call")))
+            st.session_state["_option_type_saved"] = option_type
 
 # ── 到期自动结算（在所有计算之前执行）─────────────────────────────────────────
 st.session_state.positions = auto_expire(
@@ -1143,6 +1159,128 @@ st.session_state.positions = auto_expire(
 
 # acct 在此处提前定义，供后续所有 UI 区块共享
 acct = st.session_state.account
+
+# ── 复盘交易图页面 ─────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="反推标的价格…")
+def _underlying_for(files: tuple, ticker: str) -> pd.Series:
+    frames = [load_data(p, ticker) for p in files]
+    return trade_chart.underlying_series(pd.concat(frames, ignore_index=True))
+
+
+def render_trade_replay(df: pd.DataFrame, selected_ticker: str, selected_files: list,
+                        selected_date: date) -> None:
+    """复盘交易图页：筛选 + TradingView 交互图 + 交易明细 + 单笔合约走势。"""
+    _all_pos = [p for p in st.session_state.positions + st.session_state.closed_positions
+                if p.get("ticker", selected_ticker) == selected_ticker]
+    if not _all_pos:
+        st.info("加载 workspace 或建仓后，这里会把每笔交易的开仓/平仓点画在标的价格上。")
+    else:
+        _under = _underlying_for(tuple(sorted(selected_files)), selected_ticker)
+        _trades = trade_chart.build_trade_table(
+            [p for p in st.session_state.positions if p.get("ticker", selected_ticker) == selected_ticker],
+            [p for p in st.session_state.closed_positions if p.get("ticker", selected_ticker) == selected_ticker],
+            _under,
+            st.session_state.account.get("history", []),
+        )
+        _d0, _d1 = min(_under.index), max(_under.index)
+
+        f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
+        with f1:
+            _rng = st.date_input("日期范围", value=(_d0, _d1), min_value=_d0, max_value=_d1,
+                                 key="tc_range")
+        _kinds = sorted((_trades["dir_label"] + " " + _trades["type"]).unique())
+        with f2:
+            _sel_kinds = st.multiselect("交易类型", _kinds, default=_kinds, key="tc_kinds")
+        _outs = list(dict.fromkeys(_trades["outcome"]))
+        with f3:
+            _sel_outs = st.multiselect("平仓方式", _outs, default=_outs, key="tc_outs")
+        with f4:
+            _pnl = st.radio("盈亏", ["全部", "盈利", "亏损"], key="tc_pnl")
+
+        _r0, _r1 = (_rng if isinstance(_rng, tuple) and len(_rng) == 2 else (_d0, _d1))
+        _m = ((_trades["dir_label"] + " " + _trades["type"]).isin(_sel_kinds)
+              & _trades["outcome"].isin(_sel_outs)
+              & (_trades["entry_date"] >= _r0) & (_trades["entry_date"] <= _r1))
+        _rz = _trades["realized"].fillna(0)
+        if _pnl == "盈利":
+            _m &= _trades["realized"].notna() & (_rz >= 0)
+        elif _pnl == "亏损":
+            _m &= _rz < 0
+        _shown = _trades[_m]
+        try:
+            _dark = st.context.theme.type == "dark"
+        except Exception:
+            _dark = False
+        st.iframe(
+            trade_chart.chart_html(trade_chart.chart_payload(_under, _shown, as_of=selected_date),
+                                   selected_ticker, dark=_dark, height=640),
+            height=680,
+        )
+        _outside = int(((_trades["entry_date"] < _d0) | (_trades["entry_date"] > _d1)).sum())
+        st.caption(
+            f"显示 {len(_shown)} / {len(_trades)} 笔。标的价格由期权链 Put-Call Parity 反推（每日 15:45 快照，未复权，"
+            f"与行权价同一口径）。▼ Short / ▲ Long，蓝 Put / 橙 Call；"
+            f"平仓 ● 到期作废 · ■ 提前平仓 · ●行权 = 被行权 · ●ITM = Long 到期实值结算，绿盈红亏。每笔交易 = 一段行权价虚线（开仓日 → 平仓日，"
+            f"未平仓画到当前模拟日），虚线与价格线的距离就是安全垫。默认显示交易区间，滚轮缩放、拖动平移，Y 轴自动适配。"
+            + (f" ⚠️ 有 {_outside} 笔开仓日不在已选数据文件范围内，请在侧边栏多选对应年份。" if _outside else "")
+        )
+
+        if not _shown.empty:
+            _tbl = _shown[["id", "dir_label", "type", "strike", "qty", "expiry", "entry_date",
+                           "entry_mid", "close_date", "close_mid", "outcome", "realized"]].copy()
+            _tbl.columns = ["#", "方向", "类型", "行权价", "张数", "到期", "开仓日", "开仓价",
+                            "平仓日", "平仓价", "方式", "盈亏"]
+            for c in ("到期", "开仓日", "平仓日"):
+                _tbl[c] = _tbl[c].astype(str).replace("None", "—")
+            st.dataframe(_tbl, hide_index=True, width="stretch", column_config={
+                "行权价": st.column_config.NumberColumn(format="$%.2f"),
+                "开仓价": st.column_config.NumberColumn(format="$%.2f"),
+                "平仓价": st.column_config.NumberColumn(format="$%.2f"),
+                "盈亏": st.column_config.NumberColumn(format="$%+.2f"),
+            })
+
+            _pick = st.selectbox("查看单笔合约价格走势", list(_shown["id"]),
+                                 format_func=lambda i: _trades.loc[_trades["id"] == i, "label"].iloc[0],
+                                 key="tc_pick")
+            _row = _trades[_trades["id"] == _pick].iloc[0]
+            _pos = {"expiry": _row["expiry"], "strike": _row["strike"], "type": _row["type"],
+                    "entry_date": _row["entry_date"], "close_date": _row["close_date"]}
+            _series = trade_chart.contract_series(df, _pos)
+            if _series.empty:
+                st.info("所选合约在已加载的数据文件中没有报价（可能 Δ/DTE 超出抓取范围）。")
+            else:
+                st.plotly_chart(trade_chart.contract_figure(_series, _row),
+                                width="stretch", key="tc_contract")
+
+
+def render_trade_history(acct: dict) -> None:
+    with st.expander(f"📜 交易流水（{len(acct['history'])} 条）", expanded=False):
+        if not acct["history"]:
+            st.info("暂无交易。")
+        else:
+            hist_df = pd.DataFrame(acct["history"])
+            hist_df = hist_df[["date", "action", "symbol", "qty", "price",
+                               "cash_delta", "realized", "note"]].copy()
+            hist_df.columns = ["日期", "动作", "合约代码", "张数", "价格",
+                               "现金变化", "已实现PnL", "备注"]
+            hist_df["日期"] = hist_df["日期"].astype(str)
+            st.dataframe(
+                hist_df.style.format({
+                    "价格": "${:.2f}",
+                    "现金变化": "${:+,.2f}",
+                    "已实现PnL": "${:+,.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+if is_replay:
+    st.title(f"{selected_ticker} 交易复盘")
+    render_trade_replay(df, selected_ticker, selected_files, selected_date)
+    render_trade_history(acct)
+    st.stop()
+
 
 # ── Filter chain ───────────────────────────────────────────────────────────────
 filtered = (
@@ -1928,25 +2066,6 @@ else:
     }, index=equity.index)
     st.line_chart(chart_df, use_container_width=True)
 
-# ── Trade history ──────────────────────────────────────────────────────────────
-with st.expander(f"📜 交易流水（{len(acct['history'])} 条）", expanded=False):
-    if not acct["history"]:
-        st.info("暂无交易。")
-    else:
-        hist_df = pd.DataFrame(acct["history"])
-        hist_df = hist_df[["date", "action", "symbol", "qty", "price",
-                           "cash_delta", "realized", "note"]].copy()
-        hist_df.columns = ["日期", "动作", "合约代码", "张数", "价格",
-                           "现金变化", "已实现PnL", "备注"]
-        hist_df["日期"] = hist_df["日期"].astype(str)
-        st.dataframe(
-            hist_df.style.format({
-                "价格": "${:.2f}",
-                "现金变化": "${:+,.2f}",
-                "已实现PnL": "${:+,.2f}",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+render_trade_history(acct)
 
 st.caption("数据来源：QuantConnect Research Notebook | 保证金/正股持仓为下一版本实现")

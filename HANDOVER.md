@@ -129,7 +129,8 @@
 | 文件 | 大小 | 说明 |
 |------|------|------|
 | `options_dashboard.py` | ~85 KB | **Streamlit 复盘工具 v6**（~1950 行） |
-| `research_tqqq_calls.py` | 8 KB | **★ v6 后** TQQQ DTE 1-60 / Δ 0.05-0.95，按年（未提交） |
+| `trade_chart.py` | 10 KB | **★ 交易复盘图**（Dashboard「📊 交易复盘图」区块）：Put-Call Parity 反推标的价格 + 每笔交易的行权价区间/开平仓点 + 单笔合约 mid/Δ。依赖 `plotly`；测试 `python -m pytest tests` |
+| `research_tqqq_calls.py` | 8 KB | **★ v6 后** TQQQ DTE 1-60 / Δ 0.05-0.95，按年 |
 | `research_qqq_shortcall.py` | 8 KB | **★ v6** QQQ DTE 1-60 / Δ 0.05-0.70，按年 |
 | `research_gld_options.py` | 8 KB | **★ v6** GLD DTE 0-60 / Δ 0.02-0.60，2022-2025 |
 | `TQQQ_trades_summary.txt` | 6 KB | **★ v6** TQQQ 38 笔交易汇总 |
