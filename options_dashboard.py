@@ -1008,12 +1008,21 @@ with st.sidebar:
     # 用 history 中的全部日期范围作为参考（fallback：全数据快照日期）
     hist_dates = [date.fromisoformat(str(h["date"]))
                   for h in st.session_state.account.get("history", [])]
-    tm_min = min(hist_dates) if hist_dates else (all_dates[0] if all_dates else date.today())
+    _tm_candidates = hist_dates + ([all_dates[0]] if all_dates else [])
+    tm_min = min(_tm_candidates) if _tm_candidates else date.today()
     tm_max = all_dates[-1] if all_dates else date.today()
+    if tm_min > tm_max:
+        tm_min = tm_max
+
+    _tm_default = st.session_state.get("_tm_last_target")
+    if _tm_default is None and all_dates:
+        _idx = min(max(st.session_state.current_date_idx, 0), len(all_dates) - 1)
+        _tm_default = all_dates[_idx]
+    _tm_default = min(max(_tm_default or tm_max, tm_min), tm_max)  # 夹紧到合法区间
 
     tm_target = st.date_input(
         "目标日期",
-        value=st.session_state.get("_tm_last_target") or all_dates[st.session_state.current_date_idx],
+        value=_tm_default,
         min_value=tm_min,
         max_value=tm_max,
         help="将账户回放到该日期当时的状态（基于交易历史精确重建）",

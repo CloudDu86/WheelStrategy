@@ -1,6 +1,6 @@
 # Project Handover — 指数+期权双轨交易轮动系统
 
-**最后更新**: 2026-11-07 (**v6** — MooMoo 交易成本模型 + 部分平仓 + 存盘 + GLD/QQQ/TQQQ 短期数据按年抓取)
+**最后更新**: 2026-11-09（**v6+** — QQQ 2012–2026 数据补全〔下载方法见第十二章〕+ `auto_wheel.py` 自动车轮回测；此前 v6：MooMoo 交易成本模型 + 部分平仓 + 存盘 + GLD/QQQ/TQQQ 短期数据按年抓取）
 **平台**: QuantConnect Cloud (Free 账户) + 本地 Streamlit Dashboard
 **用户**: Du Guanyun (cloudmori86@gmail.com)
 **工作目录**: `D:\Coding_Projects\QuantConnect\`（旧路径 `D:\Claude_Code\QuantConnect\` 已弃用；抓取脚本注释里仍写旧路径）
@@ -71,6 +71,20 @@
     - 5 个年度 CSV 已在 `data/`；旧的 2022/2023 TQQQ 数据已移入 `data/Old data/`
 11. `workspace_QQQ_Call_option_2026-06-14.json` — QQQ 短期买 Call 复盘存档
 12. `workspace_GLD_2026-06-03.json` / `workspace_QQQLeaps_2026-06-03.json` — GLD 卖 Call、QQQ LEAPS 复盘进度
+
+### 🆕 2026-11-09：QQQ 2012–2026 数据补全 + 自动车轮回测（未提交）
+
+13. **`auto_wheel.py`** — QQQ 自动车轮回测器，按用户交易逻辑自动交易：
+    - Sell Put（DTE≈14、Δ≈0.20）→ 被行权后卖 Covered Call（Δ≈0.30，行权价永不低于动态成本；低于成本则卖 ≥ 动态成本的最低行权价；权利金 < $0.15 视为深套等待）
+    - 直接买入：日线 W 底突破颈线 + 低点距 52 周高 ≥15% + 落在周线支撑区 ±3%
+    - **仓位按权益定**：`put_alloc=0.8`（新开 Put 后 持股成本+担保金 ≤ 80% 权益），直接买入每次约 `direct_alloc=0.2` 权益
+    - 早年只有月度期权时自动退到 ≤45 天的最近到期日
+    - `--years 3` 固定 3 年随机期间，输出第 1/2/3 年末的回撤、持仓、动态成本、敞口、深套天数；每段生成可在 Dashboard 加载的 workspace JSON（`data/Simulator/auto_wheel/`）
+    - 数据在 `data/` 或 `data/<TICKER>/` 下都能找到
+    - 测试：`tests/test_auto_wheel.py`
+14. **QQQ 期权 2012–2020 + 2026 年数据**已下载（下载方法见 **第十二章**），连同 2021–2025 共覆盖 2012-01 → 2026-11；QC 上 2011 年及以前没有 QQQ 期权数据
+15. **`QQQ_daily_20050101_20261106.csv`** — QQQ 未复权日线（信号/到期结算/预热用）
+16. `research_qqq_options_history.py` — 按年抓取模板（与 `research_qqq_shortcall.py` 同口径 Δ 0.05–0.70）
 
 ### ✅ v5 完成项
 
@@ -150,7 +164,8 @@
 | **QQQ_LEAPS_20180101_20251231_greeks.csv** | **37.45 MB** | **326,624** | **★ QQQ LEAPS 8 年 (DTE 30-900, Δ 0.50-0.95, Call only)** |
 | VOO_options_20220101_20251231_greeks.csv | 14.28 MB | 133,562 | VOO 4 年（2022-2025），DTE 7-60 |
 | **GLD_options_20220101_20251231_greeks.csv** | 49 MB | — | ★ v6 GLD 4 年，DTE 0-60，每日 |
-| **QQQ_options_\<YEAR\>0101_\<YEAR\>1231_greeks.csv** ×5 | 24-36 MB/年 | — | ★ v6 QQQ 2021-2025，DTE 1-60，Δ 0.05-0.70，每日 |
+| **QQQ_options_\<YEAR\>0101_\<YEAR\>1231_greeks.csv** ×15 | 1.5-40 MB/年 | — | ★ QQQ 2012-2026（2021-2025 为 v6；2012-2020、2026 为 2026-11-09 补抓），DTE 1-60，Δ 0.05-0.70，每日 15:45 快照；2026 截至 11-06。现放在 `data/QQQ/` |
+| **QQQ_daily_20050101_20261106.csv** | 0.26 MB | 5,497 | ★ QQQ 未复权日线（`data/QQQ/`） |
 | **TQQQ_options_\<YEAR\>0101_\<YEAR\>1231_greeks.csv** ×5 | 10-20 MB/年 | — | ★ v6 后 TQQQ 2021-2025，DTE 1-60，Δ 0.05-0.95，每日（2023 文件名带 ` (1)` 待改） |
 | `Old data/` | — | — | 旧 TQQQ 2022/2023 数据（DTE 7-45，Δ 0.05-0.60），已被新数据替代 |
 
@@ -452,3 +467,46 @@ python ccb.py "你的问题"
 2. **成本模型用实盘成交确认书校准**：MooMoo 平仓免费，往返成本不是开仓费 × 2
 3. **数据过滤范围要覆盖「赢家」**：买 Call 研究里 Δ 上限给到 0.95、DTE 下限给到 1，否则进 ITM 的赚钱仓位和临近到期的平仓都会从数据里消失
 4. **Streamlit selectbox 跨步进保持选中**：用固定 `key` + session_state 镜像，否则日期一变选项列表重建就会跳回第一项
+
+---
+
+## 十二、QQQ 历史期权数据下载流程（2026-11-09 实测，Free 账户）
+
+目标：补齐 QQQ 2012–2020 与 2026 年的短期期权链（与 2021–2025 文件同口径），供 `auto_wheel.py` 做 2012–2026 的 3 年随机回测。全程由 Claude 在 Claude 桌面版内置浏览器里操作用户已登录的 QC 账户完成。
+
+### 12.1 结论先看
+
+| 项目 | 结果 |
+|------|------|
+| 可用年份 | **2012–2026**（2007–2011 年 `OptionChain` 全部为空，QC 的 QQQ 期权数据从 2012 年开始） |
+| 抓取速度 | 很快：每年 12–26 秒（2026 年 28 秒），整批 2012–2020 约 2.5 分钟 |
+| 口径 | 每个交易日 15:45 `qb.OptionChain`，DTE 1–60，\|Δ\| 0.05–0.70，列与旧文件完全一致 |
+| 校验 | 重抓 2021-01 与本地旧文件对比：12,877 行**逐行一致**（mid/Δ/IV/volume/OI 差值全为 0） |
+| 早年注意 | 2012 年只有 173/248 天有 7–21 天到期合约（多为月度期权）；2013 年起每天都有 |
+
+### 12.2 走不通的路（别再试）
+
+1. **回测（Backtest）里写 Object Store**：Free 账户报错 `The current user does not have permission to write to the organization Object Store`。
+2. **项目代码里 `import gzip` 压缩**：QC 保存文件时直接拒绝（ToS 禁止在项目源码里压缩/编码/嵌入二进制）。不要尝试绕过。
+3. **直接读 Research 输出文件**：Notebook 内核跑在独立的 Research 服务器上（cwd = `/QuantConnect/research-cloud/airlock`），编辑器（code-server）的文件系统看不到它的 `Output/`。
+4. **VS Code 下载对话框里的 “Show Local”**：在内置浏览器中不会落地成文件。
+
+### 12.3 实际可行的流程
+
+1. **登录**：内置浏览器若显示 “session expired” 且点 Log In 无反应，是残留了过期会话（首页显示 Sign Out，/login 被重定向回 /lab）。先打开 `https://www.quantconnect.com/loggedout` 再登录。
+2. **建项目**：在已登录页面里用会话调用 QC API（`fetch('/api/v2/projects/create', …)`，`files/update` 写 `research.ipynb`），新建了项目 `QQQ_Options_Dump`。
+3. **运行 Notebook**：打开项目编辑器（VS Code / code-server），打开 `research.ipynb` → Select Kernel → *QuantConnect Research Server Collection* → `Foundation-Py-Default` → Run All。
+   - 代码与 `research_qqq_options_history.py` 相同：`AddEquity(Raw)` + `AddOption`，逐日 `qb.SetDateTime(当天 15:45)` + `qb.OptionChain`，按年写 `Output/QQQ_options_<Y>0101_<Y>1231_greeks.csv`。
+   - **坑 1**：`SetDateTime` 把 QuantBook 时钟拨回过去后，再请求今年的数据会返回空（History 截止到当前 qb 时间）。抓当年（2026）前先 `qb.SetDateTime(datetime.now())`。
+   - **坑 2**：第一次用了 \|Δ\| ≤ 0.60，比旧文件少了 0.60–0.70 的实值合约；改为 0.70 后与旧文件一致。
+   - **坑 3**：VS Code 的 Jupyter 变量面板检查大对象时会让内核假死，必要时 Restart（已写入磁盘的 CSV 不受影响）。
+4. **把文件弄到本地**（关键）：
+   1. 在 Notebook 里把所有 CSV 串成一个 bundle（每个文件前加一行 `=====FILE <文件名>`），按 15 MB 切成 8 段，并打印总长度和 MD5。
+   2. 每段用 `display(HTML('<a download=... href="data:application/octet-stream;base64,...">'))` 生成下载链接；点击后 VS Code 弹出“保存到哪里”，把路径改成 `/home/lean-user/workspace/qqq_bundle.partNN`（**放在 project 文件夹外**，避免大文件被同步进 QC 项目）。
+   3. 在编辑器页面用 `fetch('<code-server>/vscode-remote-resource?path=…')` 读回 8 段，拼成一个 Blob，用 `<a download>` 触发浏览器下载 → 落到 `C:\Users\kanun\Downloads\` 下的 `.tmp` 文件。
+   4. 本地校验 MD5（`8aac5e50ae0e4bcfbe51aac01e9444f0`，118,918,305 bytes）一致后，按 `=====FILE` 拆回各 CSV，放入 `data/`（现已移到 `data/QQQ/`）。
+5. **QC 账户里留下的东西**：项目 `QQQ_Options_Dump`（含 `research.ipynb`）、编辑器工作区里约 119 MB 的 `qqq_bundle.part00–07`，以及 Research 服务器上的 `Output/`、`Output2/`。不再需要可直接在 QC 删除该项目。
+
+### 12.4 以后要更新数据（例如补 2026 年 11–12 月）
+
+最省事：打开 `QQQ_Options_Dump` 项目的 Notebook，新建一个 cell，`qb.SetDateTime(datetime.now())` 后调用 `fetch(datetime(2026,1,1), datetime.now())` 写 CSV，再按 12.3 第 4 步打包下载。单个文件 < 15 MB 时可直接一个链接下载，不必切段。
