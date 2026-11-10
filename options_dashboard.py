@@ -21,8 +21,14 @@ def _scan_data_files() -> dict[str, list[tuple[str, str]]]:
       TICKER_LEAPS_<period>_greeks.csv     (深 ITM 长期 LEAPS 数据)
     """
     files = glob.glob(os.path.join(DATA_DIR, "*_greeks.csv"))
+    # 也扫描一级子目录（如 data/QQQ/），跳过旧数据 / 存档 / 缓存目录；同名文件以子目录为准
+    skip = {"Old data", "Simulator", ".cache"}
+    for sub in sorted(os.listdir(DATA_DIR)):
+        if sub not in skip and os.path.isdir(os.path.join(DATA_DIR, sub)):
+            files += glob.glob(os.path.join(DATA_DIR, sub, "*_greeks.csv"))
+    by_name = {os.path.basename(p): p for p in files}
     result: dict[str, list[tuple[str, str]]] = {}
-    for path in sorted(files):
+    for path in [by_name[n] for n in sorted(by_name)]:
         fname = os.path.basename(path)
         m = re.match(r"^([A-Z]+)_(options|LEAPS)_(.+)_greeks\.csv$", fname)
         if not m:
